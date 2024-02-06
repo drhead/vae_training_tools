@@ -22,10 +22,7 @@ class DiscriminatorBlock(nn.Module):
             use_bias=False
         )
         self.norm = nn.LayerNorm()
-        # self.norm = nn.BatchNorm(
-        #     momentum=0.9
-        # )
-
+        # self.norm = nn.BatchNorm(momentum=0.9)
 
     def __call__(self, x: jnp.ndarray, training: bool = False) -> jnp.ndarray:
         x = self.conv(x)
@@ -48,7 +45,7 @@ class NLayerDiscriminatorConfig(PretrainedConfig):
 
 class NLayerDiscriminatorModule(nn.Module):
     config: NLayerDiscriminatorConfig
-    
+
     def setup(self):
         self.ndf = self.config.ndf
         self.n_layers = self.config.n_layers
@@ -130,7 +127,7 @@ class NLayerDiscriminatorPreTrainedModel(FlaxPreTrainedModel):
     def __call__(
         self,
         pixel_values,
-        params: dict = None,
+        params: dict | None = None,
         dropout_rng: jax.random.PRNGKey = None,
         train: bool = False,
     ):

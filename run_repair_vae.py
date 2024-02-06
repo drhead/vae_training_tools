@@ -105,6 +105,8 @@ COST_LPIPS = 1.0
 
 # kurtosis concentration loss, for more natural images
 COST_KC = 0.0 # -- try 0.0003 for first KC run and calibrate to be equal to L1/L2.
+KC_ALL_WAVELETS = True # Compute KC loss for all wavelets, intead of just the min and max. Will lead to faster convergence but is much more expensive.
+KC_APPROX_CHANNEL = True # Compute KC loss for the approximate frequency channel. There is some debate if the DiffNat paper did this. We suspect this may lead to excessive bluriness.
 
 # WGAN-GP grad penalty
 COST_GRAD_PENALTY = 1e1
@@ -112,6 +114,7 @@ DISC_WEIGHT = 0.5
 
 # recursive reconstruction loss weight. expensive! should in theory reduce overall noise
 RRC_WEIGHT = 0.0
+RRC_LATENT = False # Compute the RRC loss in latent space, instead of pixel space. Cheaper, but maybe less accurate.
 
 # Here lie dragons.
 # Don't do this for finetuning, unless you know what you're doing and are prepared
@@ -127,7 +130,7 @@ COST_KL = 1e-5
 # effectively as a rescaled version of the prior should in theory solve the issue while
 # making the new distribution easy to generalize over based on the prior.
 # Right now this is MAE between the prior model's latent distribution and the current one,
-# scaled by the log variance of the prior.
+# scaled by a sigmoid mask based on the log-variance of the prior model's latent space.
 REPAIR_ENCODER = True
 COST_PRIOR_DIST = 1.0
 PRIOR_MASK_EDGE = -24
@@ -211,10 +214,11 @@ optimizer = optax.multi_transform(
 )
 
 optimizer_disc = optax.chain(
-    optax.adamw(learning_rate=LEARNING_RATE,
-                b1=0.5,
-                b2=0.9
-            )
+    optax.adamw(
+        learning_rate=LEARNING_RATE,
+        b1=0.5,
+        b2=0.9
+    )
 )
 
 optimizer = optax.MultiSteps(optimizer, GRAD_ACC_STEPS)
@@ -257,7 +261,8 @@ def reconstruct(params: Union[dict, FrozenDict], original: jax.Array) -> jax.Arr
         {"params": params},
         to_encoder(original),
         sample_posterior=False,
-        deterministic=True) # type: FlaxDecoderOutput
+        deterministic=True
+    ) # type: FlaxDecoderOutput
     return from_decoder(decoder_out.sample)
 
 @partial(jax.jit, donate_argnums=(0, 1))
@@ -268,7 +273,6 @@ def train_step(
     latent_dist: Union[FlaxDiagonalGaussianDistribution, None],
     state_disc: TrainState
 ) -> Tuple[TrainState, jax.Array, dict, jax.Array]:
-
     dropout_rng, sample_rng, new_train_rng = jax.random.split(train_rng)
 
     def encoder_loss(
@@ -293,7 +297,7 @@ def train_step(
             return current_latents, (0, 0)
 
         # Compute KL divergence loss for the latent space vs a standard gauissian.
-        # This keeps the latent space locally smooth ("Variational").
+        # This keeps the latent space locally smooth ("variational").
         loss_kl = current_latents.kl() * COST_KL
 
         # If we're not trying to repair the encoder, all we need is the KL divergence.
@@ -312,7 +316,8 @@ def train_step(
         else:
             prior_latents = cached_latents
 
-        # Compute difference between the current latents and the prior latents. A good repair keeps the latent space mostly the same.
+        # Compute difference between the current latents and the prior latents.
+        # A good repair keeps the latent space mostly the same.
         mae_prior = jnp.abs(current_latents.mode() - prior_latents.mode())
 
         # However, we do want to allow the latent space to change a lot under the logvar defects.
@@ -332,44 +337,76 @@ def train_step(
         )
         return jnp.mean(nn.softplus(-disc_fake_scores))
 
-    def reconstruction_loss(original, reconstruction):
+    def reconstruction_loss(
+        original: jax.Array,
+        reconstruction: jax.Array,
+        simple: bool = False
+    ) -> Tuple[jax.Array, dict]:
         lab_original = srgb_to_oklab(original)
         lab_reconstruction = srgb_to_oklab(reconstruction)
 
-        loss_lpips = jnp.mean(lpips_model.apply(lpips_params, original, reconstruction)) # type: ignore
         loss_l1 = jnp.abs(lab_reconstruction - lab_original).mean()
         loss_l2 = optax.l2_loss(lab_reconstruction, lab_original).mean()
-        loss_kc = compute_kc_loss_lab(lab_reconstruction) if COST_KC > 0 else 0
+        loss_lpips = jnp.mean(lpips_model.apply(lpips_params, original, reconstruction)) if not simple and COST_LPIPS > 0 else 0
+        loss_kc = compute_kc_loss_lab(lab_reconstruction, KC_ALL_WAVELETS) if not simple and COST_KC > 0 else 0
 
         loss_rec = (
-            loss_kc * COST_KC +
             loss_l1 * COST_L1 * l1_loss_schedule(state.step) +
             loss_l2 * COST_L2 * (1.0 - l1_loss_schedule(state.step)) + # type: ignore
-            loss_lpips * COST_LPIPS
+            loss_lpips * COST_LPIPS +
+            loss_kc * COST_KC
         )
 
-        loss_details = {
-            "loss_kc": loss_kc * COST_KC,
-            "loss_mae": loss_l1 * COST_L1,
-            "loss_l2": loss_l2 * COST_L2,
-            "loss_lpips": loss_lpips * COST_LPIPS,
-            "loss_rec": loss_rec
-        }
+        loss_details = { "loss_rec": loss_rec }
+
+        if COST_L1 > 0:
+            loss_details['loss_mae'] = loss_l1 * COST_L1
+
+        if COST_L2 > 0:
+            loss_details['loss_mse'] = loss_l2 * COST_L2
+
+        if not simple and COST_LPIPS > 0:
+            loss_details['loss_lpis'] = loss_lpips * COST_LPIPS
+
+        if not simple and COST_KC > 0:
+            loss_details['loss_kc'] = loss_kc * COST_KC
 
         return loss_rec, loss_details
 
     # Recursive Reconstruction Consistency loss function.
     # Intended to help maintain alignment between the encoder and decoder.
-    def recursive_consistency_loss(params, reconstruction):
+    def rrc_loss_pixel(params, reconstruction: jax.Array) -> Tuple[jax.Array, dict]:
         decoder_out = vae.apply( # type: ignore
             {"params": params},
             to_encoder(reconstruction),
             sample_posterior=False,
             deterministic=True
         ) # type: FlaxDecoderOutput
-        rec_recon = from_decoder(decoder_out.sample)
 
-        return reconstruction_loss(reconstruction, rec_recon) * RRC_WEIGHT
+        rec_loss, rec_loss_details = reconstruction_loss(
+            reconstruction,
+            from_decoder(decoder_out.sample),
+            simple=True
+        )
+        return rec_loss * RRC_WEIGHT, rec_loss_details
+
+    def rrc_loss_latent(params, latents: jax.Array, reconstruction: jax.Array) -> Tuple[jax.Array, dict]:
+        rec_latents = vae.apply(
+            {"params": params},
+            to_encoder(reconstruction),
+            sample_posterior=False,
+            deterministic=True,
+            method=vae.encode
+        )[0]
+
+        loss_kl = rec_latents.kl(latents)
+        return loss_kl, { 'loss_kl': loss_kl }
+
+    def recursive_consistency_loss(params, latents: jax.Array, reconstruction: jax.Array) -> Tuple[jax.Array, dict]:
+        if RRC_LATENT:
+            return rrc_loss_latent(params, latents, reconstruction)
+        else:
+            return rrc_loss_pixel(params, reconstruction)
 
     def calculate_adaptive_weight(sample_rng: jax.Array):
         def forward_over_last_layer(
@@ -407,7 +444,7 @@ def train_step(
             reconstruction = forward_over_last_layer(last_layer, params, latent, sample_rng)
 
             loss_rec, _ = reconstruction_loss(original, reconstruction)
-            loss_rrc, _ = recursive_consistency_loss(params, reconstruction) if RRC_WEIGHT > 0 else (0, {})
+            loss_rrc, _ = recursive_consistency_loss(params, latent, reconstruction) if RRC_WEIGHT > 0 else (0, {})
 
             return loss_rec + loss_rrc
 
@@ -463,7 +500,7 @@ def train_step(
 
         loss_disc = discriminator_loss(reconstruction)
         loss_rec, loss_details = reconstruction_loss(original, reconstruction)
-        loss_rrc, rrc_loss_details = recursive_consistency_loss(params, reconstruction) if RRC_WEIGHT > 0 else (0, {})
+        loss_rrc, rrc_loss_details = recursive_consistency_loss(params, latent_dist, reconstruction) if RRC_WEIGHT > 0 else (0, {})
 
         loss = loss_rec + loss_kl + loss_prior + loss_rrc + loss_disc * d_weight
 

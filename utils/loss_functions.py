@@ -20,29 +20,37 @@ def real_softmax(x: jax.Array, axis=None) -> jax.Array:
 def real_softmin(x: jax.Array, axis=None) -> jax.Array:
     return -jax.scipy.special.logsumexp(-x, axis=axis)
 
-def kurtosis_concentration(x: jax.Array) -> jax.Array:
-    coeffs_kt = jnp.zeros((20, x.shape[0]))
-    # NOTE: Due to shape mismatches this can't be turned into lax
-    for i in range(1, 28):
-        cA, (cH, cV, cD) = jwt.wavedec2(x, f"db{i}", level=1, mode="reflect")
+@partial(jax.jit, static_argnames=["all_wavelets", "include_cA"])
+def kurtosis_concentration(x: jax.Array, all_wavelets: bool, include_cA: bool) -> jax.Array:
+    n_wavelets = 27
+    coeffs_kt = jnp.zeros((n_wavelets, x.shape[0]))
 
-        kurt = kurtosis(jnp.stack([cA, cH, cV, cD], 1), axis=(1, 2, 3)) # type: ignore
+    # NOTE: Due to shape mismatches this can't be turned into lax
+    for i in range(n_wavelets):
+        cA, (cH, cV, cD) = jwt.wavedec2(x, f"db{i + 1}", level=1, mode="reflect")
+        ch = [cA, cH, cV, cD] if include_cA else [cH, cV, cD]
+
+        kurt = kurtosis(jnp.stack(ch, 1), axis=(1, 2, 3)) # type: ignore
         coeffs_kt = coeffs_kt.at[i].set(kurt)
 
-    return jnp.mean(real_softmax(coeffs_kt, axis=0) - real_softmin(coeffs_kt, axis=0))
+    if all_wavelets:
+        return jnp.mean(real_softmax(coeffs_kt, axis=0) - real_softmin(coeffs_kt, axis=0))
+    else:
+        return jnp.max(coeffs_kt, axis=0) - jnp.min(coeffs_kt, axis=0)
 
-def compute_kc_loss_grey(rgb: jax.Array) -> jax.Array:
+def compute_kc_loss_grey(rgb: jax.Array, all_wavelets: bool, include_cA: bool) -> jax.Array:
     rgb = jnp.transpose(rgb, (0, 3, 1, 2))
     # convert image to grayscale
     weights = jnp.array([0.299, 0.587, 0.114])
     # Perform the weighted sum along the channel axis
     grey = jnp.sum(rgb * weights[None, :, None, None], axis=1, keepdims=True)
 
-    return kurtosis_concentration(grey)
+    return kurtosis_concentration(grey, all_wavelets, include_cA)
 
-def compute_kc_loss_lab(lab: jax.Array) -> jax.Array:
+@partial(jax.jit)
+def compute_kc_loss_lab(lab: jax.Array, all_wavelets: bool, include_cA: bool) -> jax.Array:
     lab = jnp.transpose(lab, (0, 3, 1, 2))
-    return kurtosis_concentration(lab[:, 0, :, :])
+    return kurtosis_concentration(lab[:, 0, :, :], all_wavelets, include_cA)
 
 def srgb_to_oklab(srgb: jax.Array) -> jax.Array:
     # Convert to linear RGB space.
