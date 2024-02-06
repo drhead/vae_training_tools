@@ -146,9 +146,9 @@ vae, vae_params = FlaxAutoencoderKL.from_pretrained(
 vae = vae # type: FlaxAutoencoderKL
 
 # make a copy of the original VAE so we can compare its outputs to our trained model periodically
-original_params = deepcopy(vae_params)
+prior_params = deepcopy(vae_params)
 # don't forget to place it on the accelerator
-original_params = jax.device_put(original_params, jax.devices()[0])
+prior_params = jax.device_put(prior_params, jax.devices()[0])
 
 disc_model = NLayerDiscriminator(
     NLayerDiscriminatorConfig.from_pretrained("./disc_config.json"),
@@ -303,7 +303,7 @@ def train_step(
         # If we don't have the prior latents cached, generate them.
         if cached_latents is None:
             prior_latents = vae.apply( # type: ignore
-                {"params": original_params},
+                {"params": prior_params},
                 to_encoder(original),
                 deterministic=False,
                 return_dict=False,
@@ -630,7 +630,7 @@ def infer_fn_ema(batch: dict, state: TrainStateEma) -> jax.Array:
     return reconstruct(state.ema_params, batch["original"])
 
 def infer_fn_control(batch: dict) -> jax.Array:
-    return reconstruct(original_params, batch["original"])
+    return reconstruct(prior_params, batch["original"])
 
 eval_batches = []
 def evaluate(use_tqdm=False, step=None) -> None:
