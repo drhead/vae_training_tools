@@ -87,7 +87,7 @@ def srgb_to_oklab(srgb: jax.Array) -> jax.Array:
     return jnp.tensordot(lms, t_lms_oklab, axes=[3, 0])
 
 @partial(jax.jit, static_argnames=['alpha', 'beta', 'gamma'])
-def sigmod_mask(x: jax.Array, alpha: float, beta: float, gamma: float) -> jax.Array:
+def sigmoid_mask(x: jax.Array, alpha: float, beta: float, gamma: float) -> jax.Array:
     # alpha - midpoint of sigmod
     # beta  - position where mask = 0.01
     # gamma - maximum value

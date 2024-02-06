@@ -41,7 +41,7 @@ from lpips_j.lpips import LPIPS
 from utils.dataloaders import DecoderImageDataset, LatentCacheDataset
 from modeling.discriminator import NLayerDiscriminator, NLayerDiscriminatorConfig
 from utils.train_states import TrainStateEma
-from utils.loss_functions import compute_kc_loss_lab, srgb_to_oklab
+from utils.loss_functions import compute_kc_loss_lab, srgb_to_oklab, sigmoid_mask
 
 USE_WANDB = True
 PROFILE = False
@@ -146,9 +146,9 @@ vae, vae_params = FlaxAutoencoderKL.from_pretrained(
 vae = vae # type: FlaxAutoencoderKL
 
 # make a copy of the original VAE so we can compare its outputs to our trained model periodically
-original_params = deepcopy(vae_params)
+prior_params = deepcopy(vae_params)
 # don't forget to place it on the accelerator
-original_params = jax.device_put(original_params, jax.devices()[0])
+prior_params = jax.device_put(prior_params, jax.devices()[0])
 
 disc_model = NLayerDiscriminator(
     NLayerDiscriminatorConfig.from_pretrained("./disc_config.json"),
@@ -304,7 +304,7 @@ def train_step(
         if cached_latents is None:
             prior_latents = vae.apply( # type: ignore
                 {"params": prior_params},
-                to_encoder(prior),
+                to_encoder(original),
                 deterministic=False,
                 return_dict=False,
                 method=vae.encode
@@ -421,7 +421,7 @@ def train_step(
             reconstruction = forward_over_last_layer(last_layer, params, latent, sample_rng)
             return discriminator_loss(reconstruction)
 
-        rec_grads = compute_rec_loss_ll(
+        rec_grads = compute_vae_loss_ll(
             state.params['decoder']['conv_out']['kernel'],
             state.params,
             latent_dist,
@@ -631,7 +631,7 @@ def infer_fn_ema(batch: dict, state: TrainStateEma) -> jax.Array:
     return reconstruct(state.ema_params, batch["original"])
 
 def infer_fn_control(batch: dict) -> jax.Array:
-    return reconstruct(original_params, batch["original"])
+    return reconstruct(prior_params, batch["original"])
 
 eval_batches = []
 def evaluate(use_tqdm=False, step=None) -> None:
