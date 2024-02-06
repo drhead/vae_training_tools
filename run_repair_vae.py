@@ -41,7 +41,7 @@ from lpips_j.lpips import LPIPS
 from utils.dataloaders import DecoderImageDataset, LatentCacheDataset
 from modeling.discriminator import NLayerDiscriminator, NLayerDiscriminatorConfig
 from utils.train_states import TrainStateEma
-from utils.loss_functions import compute_kc_loss_lab, srgb_to_oklab
+from utils.loss_functions import compute_kc_loss_lab, srgb_to_oklab, sigmoid_mask
 
 USE_WANDB = True
 PROFILE = False
@@ -303,8 +303,8 @@ def train_step(
         # If we don't have the prior latents cached, generate them.
         if cached_latents is None:
             prior_latents = vae.apply( # type: ignore
-                {"params": prior_params},
-                to_encoder(prior),
+                {"params": original_params},
+                to_encoder(original),
                 deterministic=False,
                 return_dict=False,
                 method=vae.encode
@@ -421,7 +421,7 @@ def train_step(
             reconstruction = forward_over_last_layer(last_layer, params, latent, sample_rng)
             return discriminator_loss(reconstruction)
 
-        rec_grads = compute_rec_loss_ll(
+        rec_grads = compute_vae_loss_ll(
             state.params['decoder']['conv_out']['kernel'],
             state.params,
             latent_dist,
@@ -470,6 +470,7 @@ def train_step(
         loss_details['loss_obj'] = loss
         loss_details['loss_disc'] = loss_disc
         loss_details['d_weight'] = d_weight
+        loss_details['learning_rate'] = lr_schedule(state.step)
 
         if RRC_WEIGHT > 0:
             loss_details['loss_rrc'] = rrc_loss_details
@@ -491,9 +492,7 @@ def train_step(
         sample_rng
     )
 
-    loss_details = loss_details | {"learning_rate": lr_schedule(state.step)} # type: dict
     new_state = state.apply_gradients(grads=grad)
-
     return new_state, new_train_rng, loss_details, reconstruction
 
 @partial(jax.jit, donate_argnums=(0, 1))
@@ -511,7 +510,7 @@ def train_step_disc(
         fake_images: jax.Array,
         dropout_rng: jax.Array,
         disc_model_fn: Callable[..., jax.Array]
-    ) -> Tuple[jax.Array, Tuple[dict, dict, dict]]:
+    ) -> Tuple[jax.Array, dict]:
 
         # Forward pass for both real and fake images
         disc_real_scores = disc_model_fn(
