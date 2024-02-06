@@ -128,7 +128,10 @@ COST_KL = 1e-5
 # making the new distribution easy to generalize over based on the prior.
 # Right now this is MAE between the prior model's latent distribution and the current one,
 # scaled by the log variance of the prior.
+REPAIR_ENCODER = True
 COST_PRIOR_DIST = 1.0
+PRIOR_MASK_EDGE = -24
+PRIOR_MASK_CENTER = -30
 
 # I highly recommend starting from "stabilityai/sd-vae-ft-mse" if using this for a SD1.5/2.1 decoder finetune.
 # It is much better trained than the stock kl-f8 autoencoder from SD 1.5 and losses starting out will likely be lower.
@@ -241,60 +244,84 @@ train_state_disc = TrainState.create(
 train_state = jax.device_put(train_state, jax.devices()[0]) # type: TrainState
 train_state_disc = jax.device_put(train_state_disc, jax.devices()[0]) # type: TrainState
 
+def to_encoder(img: jax.Array) -> jax.Array:
+    return jnp.transpose(img * 2.0 - 1.0, (0, 3, 1, 2))
+
+def from_decoder(dec: jax.Array) -> jax.Array:
+    return jnp.transpose(dec, (0, 2, 3, 1)) / 2 + 0.5
+
+
 @jax.jit
 def reconstruct(params: Union[dict, FrozenDict], original: jax.Array) -> jax.Array:
     decoder_out = vae.apply( # type: ignore
         {"params": params},
-        jnp.transpose(original * 2.0 - 1.0, (0, 3, 1, 2)),
+        to_encoder(original),
         sample_posterior=False,
         deterministic=True) # type: FlaxDecoderOutput
-    return jnp.transpose(decoder_out.sample, (0, 2, 3, 1)) / 2 + 0.5
+    return from_decoder(decoder_out.sample)
 
 @partial(jax.jit, donate_argnums=(0, 1))
 def train_step(
-        state: TrainState,
-        train_rng: jax.Array,
-        original: jax.Array,
-        latent_dist: Union[FlaxDiagonalGaussianDistribution, None],
-        state_disc: TrainState
+    state: TrainState,
+    train_rng: jax.Array,
+    original: jax.Array,
+    latent_dist: Union[FlaxDiagonalGaussianDistribution, None],
+    state_disc: TrainState
 ) -> Tuple[TrainState, jax.Array, dict, jax.Array]:
 
     dropout_rng, sample_rng, new_train_rng = jax.random.split(train_rng)
 
     def encoder_loss(
         params,
-        latent_dist: Union[FlaxDiagonalGaussianDistribution, None]
+        cached_latents: Union[FlaxDiagonalGaussianDistribution, None]
     ) -> Tuple[FlaxDiagonalGaussianDistribution, jax.Array]:
-        if latent_dist is None or TRAIN_ENCODER:
-            if latent_dist is not None:
-                # If we're training the encoder and there's a cached dist it's the prior
-                prior_latent_dist = latent_dist
-            else:
-                # Encode a prior because we're not using the cache here.
-                prior_latent_dist = vae.apply( # type: ignore
-                    {"params": original_params},
-                    jnp.transpose(original * 2.0 - 1.0, (0, 3, 1, 2)),
-                    deterministic=False,
-                    return_dict=False,
-                    method=vae.encode)[0] # type: FlaxDiagonalGaussianDistribution
+        # If we're not training the encoder, use the cached latents if they exist.
+        if not TRAIN_ENCODER and cached_latents is not None:
+            return cached_latents, (0, 0)
 
-            # Regardless of whether we're training the encoder here we need a dist
-            latent_dist = vae.apply( # type: ignore
-                {"params": params},
-                jnp.transpose(original * 2.0 - 1.0, (0, 3, 1, 2)),
+        # Compute latents given the current state of the encoder.
+        current_latents = vae.apply( # type: ignore
+            {"params": params},
+            to_encoder(original),
+            deterministic=False,
+            return_dict=False,
+            method=vae.encode
+        )[0] # type: FlaxDiagonalGaussianDistribution
+
+        # If we're not training the encoder, all we need are the encoded latents.
+        if not TRAIN_ENCODER:
+            return current_latents, (0, 0)
+
+        # Compute KL divergence loss for the latent space vs a standard gauissian.
+        # This keeps the latent space locally smooth ("Variational").
+        loss_kl = current_latents.kl() * COST_KL
+
+        # If we're not trying to repair the encoder, all we need is the KL divergence.
+        if not REPAIR_ENCODER:
+            return current_latents, (loss_kl, 0)
+
+        # If we don't have the prior latents cached, generate them.
+        if cached_latents is None:
+            prior_latents = vae.apply( # type: ignore
+                {"params": prior_params},
+                to_encoder(prior),
                 deterministic=False,
                 return_dict=False,
-                method=vae.encode)[0] # type: FlaxDiagonalGaussianDistribution
-            if TRAIN_ENCODER:
-                loss_kl = latent_dist.kl() * COST_KL
-                loss_prior = (jnp.abs(latent_dist.mode() - prior_latent_dist.mode()) * prior_latent_dist.var).mean() * COST_PRIOR_DIST
-            else:
-                loss_kl = 0
-                loss_prior = 0
+                method=vae.encode
+            )[0] # type: FlaxDiagonalGaussianDistribution
         else:
-            loss_kl = 0
-            loss_prior = 0
-        return latent_dist, (loss_kl, loss_prior)
+            prior_latents = cached_latents
+
+        # Compute difference between the current latents and the prior latents. A good repair keeps the latent space mostly the same.
+        mae_prior = jnp.abs(current_latents.mode() - prior_latents.mode())
+
+        # However, we do want to allow the latent space to change a lot under the logvar defects.
+        mae_mask = sigmoid_mask(prior_latents.logvar, PRIOR_MASK_EDGE, PRIOR_MASK_CENTER, COST_PRIOR_DIST)
+
+        # Apply the mask and scale down loss by the size of the latent space.
+        loss_prior = jnp.mean(mae_prior * mae_mask)
+
+        return current_latents, (loss_kl, loss_prior)
 
     def discriminator_loss(reconstruction):
         disc_fake_scores = state_disc.apply_fn(
@@ -308,16 +335,19 @@ def train_step(
     def reconstruction_loss(original, reconstruction):
         lab_original = srgb_to_oklab(original)
         lab_reconstruction = srgb_to_oklab(reconstruction)
+
         loss_lpips = jnp.mean(lpips_model.apply(lpips_params, original, reconstruction)) # type: ignore
         loss_l1 = jnp.abs(lab_reconstruction - lab_original).mean()
         loss_l2 = optax.l2_loss(lab_reconstruction, lab_original).mean()
         loss_kc = compute_kc_loss_lab(lab_reconstruction) if COST_KC > 0 else 0
+
         loss_rec = (
             loss_kc * COST_KC +
             loss_l1 * COST_L1 * l1_loss_schedule(state.step) +
             loss_l2 * COST_L2 * (1.0 - l1_loss_schedule(state.step)) + # type: ignore
             loss_lpips * COST_LPIPS
         )
+
         loss_details = {
             "loss_kc": loss_kc * COST_KC,
             "loss_mae": loss_l1 * COST_L1,
@@ -325,6 +355,7 @@ def train_step(
             "loss_lpips": loss_lpips * COST_LPIPS,
             "loss_rec": loss_rec
         }
+
         return loss_rec, loss_details
 
     # Recursive Reconstruction Consistency loss function.
@@ -332,58 +363,62 @@ def train_step(
     def recursive_consistency_loss(params, reconstruction):
         decoder_out = vae.apply( # type: ignore
             {"params": params},
-            jnp.transpose(reconstruction * 2.0 - 1.0, (0, 3, 1, 2)),
+            to_encoder(reconstruction),
             sample_posterior=False,
-            deterministic=True) # type: FlaxDecoderOutput
-        reconstruction_prime = jnp.transpose(decoder_out.sample, (0, 2, 3, 1)) / 2 + 0.5
-        return reconstruction_loss(reconstruction, reconstruction_prime)
+            deterministic=True
+        ) # type: FlaxDecoderOutput
+        rec_recon = from_decoder(decoder_out.sample)
+
+        return reconstruction_loss(reconstruction, rec_recon) * RRC_WEIGHT
 
     def calculate_adaptive_weight(sample_rng: jax.Array):
         def forward_over_last_layer(
-                last_layer: jax.Array,
-                params: dict,
-                latent_dist: Union[FlaxDiagonalGaussianDistribution, None],
-                sample_rng: jax.Array
-            ) -> jax.Array:
+            last_layer: jax.Array,
+            params: dict,
+            latent_dist: FlaxDiagonalGaussianDistribution,
+            sample_rng: jax.Array
+        ) -> jax.Array:
             # We need the whole params for the model but need the passed last layer to grad
             # Save the old last layer, we need it later, and replace it with the passed one
             old_lastlayer = params['decoder']['conv_out']['kernel']
             params['decoder']['conv_out']['kernel'] = last_layer
-            latent_dist, loss_enc = encoder_loss(params, latent_dist)
+
             decoder_out = vae.apply( # type: ignore
                 {"params": params},
                 latent_dist.sample(sample_rng),
                 deterministic=False,
                 return_dict=False,
-                method=vae.decode)[0] # type: FlaxDecoderOutput
+                method=vae.decode
+            )[0] # type: FlaxDecoderOutput
+
             # Put the last layer back, so that this function is technically "side-effect free"
             params['decoder']['conv_out']['kernel'] = old_lastlayer
-            return jnp.transpose(decoder_out, (0, 2, 3, 1)) / 2 + 0.5, loss_enc
+
+            return from_decoder(decoder_out)
 
         @jax.grad
-        def compute_rec_loss_ll(
-                last_layer: jax.Array,
-                params: dict,
-                latent: jax.Array,
-                original: jax.Array,
-                sample_rng: jax.Array
-            ) -> jax.Array:
-            reconstruction, (loss_kl, loss_prior) = forward_over_last_layer(last_layer, params, latent, sample_rng)
+        def compute_vae_loss_ll(
+            last_layer: jax.Array,
+            params: dict,
+            latent: jax.Array,
+            original: jax.Array,
+            sample_rng: jax.Array
+        ) -> jax.Array:
+            reconstruction = forward_over_last_layer(last_layer, params, latent, sample_rng)
 
             loss_rec, _ = reconstruction_loss(original, reconstruction)
             loss_rrc, _ = recursive_consistency_loss(params, reconstruction) if RRC_WEIGHT > 0 else (0, {})
 
-            return loss_rec + loss_kl + loss_prior + loss_rrc * RRC_WEIGHT
+            return loss_rec + loss_rrc
 
         @jax.grad
         def compute_disc_loss_ll(
-                last_layer: jax.Array,
-                params: dict,
-                latent: jax.Array,
-                sample_rng: jax.Array
-            ) -> jax.Array:
+            last_layer: jax.Array,
+            params: dict,
+            latent: jax.Array,
+            sample_rng: jax.Array
+        ) -> jax.Array:
             reconstruction = forward_over_last_layer(last_layer, params, latent, sample_rng)
-
             return discriminator_loss(reconstruction)
 
         rec_grads = compute_rec_loss_ll(
@@ -399,42 +434,51 @@ def train_step(
             latent_dist,
             sample_rng
         )
+
         # Calculate the adaptive weight
         d_weight = jnp.linalg.norm(rec_grads) / (jnp.linalg.norm(disc_grads) + 1e-4)
         d_weight = jnp.clip(d_weight, 0.0, 1e4)
         d_weight = d_weight * DISC_WEIGHT
+
         return jax.lax.stop_gradient(d_weight)
 
     @partial(jax.grad, has_aux=True)
     def compute_loss(
-            params: dict,
-            d_weight,
-            latent_dist: Union[FlaxDiagonalGaussianDistribution, None],
-            original: jax.Array,
-            sample_rng: jax.Array
-        ):
+        params: dict,
+        d_weight,
+        latent_dist: Union[FlaxDiagonalGaussianDistribution, None],
+        original: jax.Array,
+        sample_rng: jax.Array
+    ):
         latent_dist, (loss_kl, loss_prior) = encoder_loss(params, latent_dist)
+
         decoder_out = vae.apply( # type: ignore
             {"params": params},
             latent_dist.sample(sample_rng),
             deterministic=False,
             return_dict=False,
-            method=vae.decode)[0] # type: FlaxDecoderOutput
-        reconstruction = jnp.transpose(decoder_out, (0, 2, 3, 1)) / 2 + 0.5
+            method=vae.decode
+        )[0] # type: FlaxDecoderOutput
+        reconstruction = from_decoder(decoder_out)
 
         loss_disc = discriminator_loss(reconstruction)
         loss_rec, loss_details = reconstruction_loss(original, reconstruction)
         loss_rrc, rrc_loss_details = recursive_consistency_loss(params, reconstruction) if RRC_WEIGHT > 0 else (0, {})
 
-        loss = loss_rec + loss_kl + loss_prior + loss_rrc * RRC_WEIGHT + loss_disc * d_weight
+        loss = loss_rec + loss_kl + loss_prior + loss_rrc + loss_disc * d_weight
 
-        loss_details['loss_disc'] = loss_disc
         loss_details['loss_obj'] = loss
-        loss_details['loss_kl'] = loss_kl
-        loss_details['loss_prior'] = loss_prior
+        loss_details['loss_disc'] = loss_disc
         loss_details['d_weight'] = d_weight
+
         if RRC_WEIGHT > 0:
-            loss_details['recursive_loss'] = rrc_loss_details
+            loss_details['loss_rrc'] = rrc_loss_details
+
+        if TRAIN_ENCODER:
+            loss_details['loss_kl'] = loss_kl
+
+        if TRAIN_ENCODER and REPAIR_ENCODER:
+            loss_details['loss_prior'] = loss_prior
 
         return loss, (loss_details, reconstruction)
 
@@ -447,12 +491,9 @@ def train_step(
         sample_rng
     )
 
-    # legacy code, I didn't use multi gpu
-    # grad = jax.lax.pmean(grad, "batch")
     loss_details = loss_details | {"learning_rate": lr_schedule(state.step)} # type: dict
     new_state = state.apply_gradients(grads=grad)
 
-    # metrics = jax.lax.pmean(metrics, axis_name="batch")
     return new_state, new_train_rng, loss_details, reconstruction
 
 @partial(jax.jit, donate_argnums=(0, 1))
@@ -523,9 +564,11 @@ def train_step_disc(
         return disc_loss, disc_loss_details
 
     dropout_rng, new_train_rng = jax.random.split(train_rng)
+
     # convert fake images to int then back to float, so discriminator can't cheat
     dtype = reconstruction.dtype
     reconstruction = (reconstruction.clip(0, 1) * 255).astype(jnp.uint8).astype(dtype) / 255
+
     disc_grads, disc_loss_details = compute_stylegan_loss(
         state_disc.params,
         srgb_to_oklab(original),
@@ -676,7 +719,7 @@ def data_iter():
 def encode_latent_for_cache(original: jax.Array):
     posterior = vae.apply( # type: ignore
         {"params": train_state.params},
-        jnp.transpose(original * 2.0 - 1.0, (0, 3, 1, 2)),
+        to_encoder(original),
         deterministic=False,
         method=vae.encode
     ) # type: FlaxAutoencoderKLOutput
@@ -692,8 +735,10 @@ def vae_decode_only(latent: jax.Array):
         {"params": vae_params},
         latent,
         deterministic=False,
-        method=vae.decode) # type: FlaxDecoderOutput
-    return jnp.transpose(decoder_out.sample, (0, 2, 3, 1)) / 2 + 0.5
+        method=vae.decode
+    ) # type: FlaxDecoderOutput
+
+    return from_decoder(decoder_out.sample)
 
 
 
@@ -701,6 +746,7 @@ dataset = LatentCacheDataset('/mnt/foxhole/vae_latent_cache', 150000, mmap_prelo
 metrics_dict = {}
 metrics_list = []
 steps_since_log = 0
+
 for steps, batch in tqdm(enumerate(dataset), total=len(dataset), desc="Training...", dynamic_ncols=True):
     if PROFILE and steps == 100:
         jax.profiler.start_trace("./tensorboard")
@@ -712,8 +758,7 @@ for steps, batch in tqdm(enumerate(dataset), total=len(dataset), desc="Training.
         batch["latent_dist"],
         train_state_disc
     )
-    # fake = vae_decode_only(batch['latent'])
-    # metrics = {}
+
     if disc_loss_skip_schedule(train_state.step) > 0:
         train_state_disc, training_rng, metrics["disc_step"] = train_step_disc(
             train_state_disc,
@@ -742,17 +787,23 @@ for steps, batch in tqdm(enumerate(dataset), total=len(dataset), desc="Training.
             wandb.log(metrics_dict, step=steps)
         metrics_dict = jax.tree_map(lambda x: 0.0, metrics_dict)
         steps_since_log = 0
+
     if steps % EVAL_STEPS == 1:
         evaluate(step=steps)
         log_test_images(step=steps)
         log_train_images(step=steps)
+
         with Path(output_dir / "latest_state_disc.msgpack").open("wb") as f:
             f.write(to_bytes(jax.device_get(train_state_disc)))
+
         with Path(output_dir / "latest_state.msgpack").open("wb") as f:
             f.write(to_bytes(jax.device_get(train_state)))
+
         gc.collect()
+
     if steps % CHECKPOINT_STEPS == 1:
         save_checkpoint(train_state)
+
     if steps == TOTAL_STEPS:
         break
 

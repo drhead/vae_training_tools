@@ -2,6 +2,9 @@ import jax
 import jax.numpy as jnp
 import jaxwt as jwt
 
+from functools import partial
+
+@partial(jax.jit, static_argnames="axis")
 def kurtosis(x: jax.Array, axis=None) -> jax.Array:
     epsilon = 1e-10
     mean_squared = jnp.mean(x ** 2, axis=axis)
@@ -9,16 +12,18 @@ def kurtosis(x: jax.Array, axis=None) -> jax.Array:
     kurt = (jnp.mean(x ** 4, axis=axis) / mean_squared ** 2) - 3
     return kurt
 
+@partial(jax.jit, static_argnames="axis")
 def real_softmax(x: jax.Array, axis=None) -> jax.Array:
     return jax.scipy.special.logsumexp(x, axis=axis)
 
+@partial(jax.jit, static_argnames="axis")
 def real_softmin(x: jax.Array, axis=None) -> jax.Array:
     return -jax.scipy.special.logsumexp(-x, axis=axis)
 
 def kurtosis_concentration(x: jax.Array) -> jax.Array:
     coeffs_kt = jnp.zeros((20, x.shape[0]))
     # NOTE: Due to shape mismatches this can't be turned into lax
-    for i in range(1,28):
+    for i in range(1, 28):
         cA, (cH, cV, cD) = jwt.wavedec2(x, f"db{i}", level=1, mode="reflect")
 
         kurt = kurtosis(jnp.stack([cA, cH, cV, cD], 1), axis=(1, 2, 3)) # type: ignore
@@ -80,3 +85,12 @@ def srgb_to_oklab(srgb: jax.Array) -> jax.Array:
     ])
 
     return jnp.tensordot(lms, t_lms_oklab, axes=[3, 0])
+
+@partial(jax.jit, static_argnames=['alpha', 'beta', 'gamma'])
+def sigmod_mask(x: jax.Array, alpha: float, beta: float, gamma: float) -> jax.Array:
+    # alpha - midpoint of sigmod
+    # beta  - position where mask = 0.01
+    # gamma - maximum value
+
+    k = -jnp.log(99) / (beta - alpha)
+    return gamma / (1 + jnp.exp(-k * (x - alpha)))
