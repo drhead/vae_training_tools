@@ -4,7 +4,7 @@ from flax.linen.fp8_ops import OVERWRITE_WITH_GRADIENT
 from flax.training.train_state import TrainState
 from copy import deepcopy
 import optax
-from typing import Any, List
+from typing import Any, List, Tuple
 
 class TrainStateEma(TrainState):
     ema_params: flax.core.FrozenDict[str, Any] = flax.struct.field(pytree_node=True)
@@ -83,7 +83,7 @@ class TrainStateEma(TrainState):
 class TrainStateEmaGamma(TrainState):
     # Alternative EMA tracking proposed by Karras, et al. Dec 2023
     ema_params: List[flax.core.FrozenDict[str, Any]] = flax.struct.field(pytree_node=True)
-    ema_gammas: List[float] = [6.94, 16.97]
+    ema_gammas: Tuple[float] = (6.94, 16.97)
 
     @classmethod
     def create(cls, *, apply_fn, params, tx, ema_gammas, **kwargs):

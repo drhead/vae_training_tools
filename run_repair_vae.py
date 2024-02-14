@@ -29,7 +29,6 @@ from flax.training.train_state import TrainState
 from flax.core.frozen_dict import FrozenDict
 import optax
 
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 from PIL import Image
 Image.MAX_IMAGE_PIXELS = None
@@ -38,7 +37,7 @@ from diffusers.models.vae_flax import FlaxAutoencoderKL, FlaxDecoderOutput, Flax
 from datasets import Dataset as HFDataset
 from lpips_j.lpips import LPIPS
 
-from utils.dataloaders import DecoderImageDataset, LatentCacheDataset
+from utils.dataloaders import DecoderImageDataset, LatentCacheDataset, JaxBatchDataloader
 from modeling.discriminator import NLayerDiscriminator, NLayerDiscriminatorConfig
 from utils.train_states import TrainStateEma
 from utils.loss_functions import compute_kc_loss_lab, srgb_to_oklab, sigmoid_mask
@@ -50,11 +49,11 @@ TRAIN_EMA = True
 EMA_DECAY = (1 - 0.001 / 6) # ~0.99983, EMA decay value used for sd-vae-ft adjusted for batch
 # paths and configs
 if USE_WANDB:
-    wandb.init(project="fluffy-vae")
+    wandb.init(project="compvis-vae-repair")
 
 # cards supporting bfloat16 can easily support batches of 16 for every 20GB or so
 # recommend raising in increments of 8 until it OOMs then take a step back
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 GRAD_ACC_STEPS = 1
 
 # Split latent cache batches into N fragments.
@@ -76,12 +75,12 @@ DISC_LOSS_SKIP_STEPS = 0 * GRAD_ACC_STEPS
 L1_L2_SWITCH_STEPS = 100000 * GRAD_ACC_STEPS
 
 # will dump checkpoints every {CHECKPOINT_STEPS} steps to this directory, as FlaxAutoencoderKL checkpoints
-CHECKPOINT_SAVE_PATH = "/mnt/foxhole/checkpoints/sd_vae_trainer/"
+CHECKPOINT_SAVE_PATH = "/mnt/foxhole/checkpoints/vae_training_tools/"
 
 # a huggingface dataset containing columns "path"
 # path: can be absolute or relative to `DATA_ROOT`
 DATA_ROOT = "/"
-hfds = HFDataset.from_csv("./dataset.csv")
+hfds = HFDataset.from_csv("../sd_vae_trainer/dataset.csv")
 
 # this corresponds to a local dir containing the config.json file
 # the config.json file is copied from https://github.com/patil-suraj/vit-vqgan/
@@ -122,7 +121,7 @@ RRC_LATENT = False # Compute the RRC loss in latent space, instead of pixel spac
 TRAIN_ENCODER = True
 
 # KL regularization. CompVis used a small amount (1e-6). It probably should be higher.
-COST_KL = 1e-5
+COST_KL = 1e-4
 
 # What should hopefully make repair of the VAE feasible.
 # Compvis KL-F8's anomaly is believed to be a spot the model learned to blow out in order
@@ -132,7 +131,7 @@ COST_KL = 1e-5
 # Right now this is MAE between the prior model's latent distribution and the current one,
 # scaled by a sigmoid mask based on the log-variance of the prior model's latent space.
 REPAIR_ENCODER = True
-COST_PRIOR_DIST = 1.0
+COST_PRIOR_DIST = 100.0
 PRIOR_MASK_EDGE = -24
 PRIOR_MASK_CENTER = -30
 
@@ -273,7 +272,7 @@ def train_step(
     latent_dist: Union[FlaxDiagonalGaussianDistribution, None],
     state_disc: TrainState
 ) -> Tuple[TrainState, jax.Array, dict, jax.Array]:
-    dropout_rng, sample_rng, new_train_rng = jax.random.split(train_rng)
+    dropout_rng, sample_rng, new_train_rng = jax.random.split(train_rng, 3)
 
     def encoder_loss(
         params,
@@ -298,7 +297,7 @@ def train_step(
 
         # Compute KL divergence loss for the latent space vs a standard gauissian.
         # This keeps the latent space locally smooth ("variational").
-        loss_kl = current_latents.kl() * COST_KL
+        loss_kl = jnp.mean(current_latents.kl())
 
         # If we're not trying to repair the encoder, all we need is the KL divergence.
         if not REPAIR_ENCODER:
@@ -321,7 +320,7 @@ def train_step(
         mae_prior = jnp.abs(current_latents.mode() - prior_latents.mode())
 
         # However, we do want to allow the latent space to change a lot under the logvar defects.
-        mae_mask = sigmoid_mask(prior_latents.logvar, PRIOR_MASK_EDGE, PRIOR_MASK_CENTER, COST_PRIOR_DIST)
+        mae_mask = sigmoid_mask(prior_latents.logvar, PRIOR_MASK_EDGE, PRIOR_MASK_CENTER, 1)
 
         # Apply the mask and scale down loss by the size of the latent space.
         loss_prior = jnp.mean(mae_prior * mae_mask)
@@ -360,16 +359,16 @@ def train_step(
         loss_details = { "loss_rec": loss_rec }
 
         if COST_L1 > 0:
-            loss_details['loss_mae'] = loss_l1 * COST_L1
+            loss_details['loss_mae'] = loss_l1
 
         if COST_L2 > 0:
-            loss_details['loss_mse'] = loss_l2 * COST_L2
+            loss_details['loss_mse'] = loss_l2
 
         if not simple and COST_LPIPS > 0:
-            loss_details['loss_lpis'] = loss_lpips * COST_LPIPS
+            loss_details['loss_lpis'] = loss_lpips
 
         if not simple and COST_KC > 0:
-            loss_details['loss_kc'] = loss_kc * COST_KC
+            loss_details['loss_kc'] = loss_kc
 
         return loss_rec, loss_details
 
@@ -408,7 +407,11 @@ def train_step(
         else:
             return rrc_loss_pixel(params, reconstruction)
 
-    def calculate_adaptive_weight(sample_rng: jax.Array):
+    def calculate_adaptive_weight(
+        sample_rng: jax.Array,
+        latent_dist: FlaxDiagonalGaussianDistribution = None
+    ) -> jax.Array:
+
         def forward_over_last_layer(
             last_layer: jax.Array,
             params: dict,
@@ -458,6 +461,15 @@ def train_step(
             reconstruction = forward_over_last_layer(last_layer, params, latent, sample_rng)
             return discriminator_loss(reconstruction)
 
+        if latent_dist is None:
+            latent_dist = vae.apply( # type: ignore
+                {"params": state.params},
+                to_encoder(original),
+                deterministic=False,
+                return_dict=False,
+                method=vae.encode
+            )[0] # type: FlaxDiagonalGaussianDistribution
+
         rec_grads = compute_vae_loss_ll(
             state.params['decoder']['conv_out']['kernel'],
             state.params,
@@ -502,7 +514,7 @@ def train_step(
         loss_rec, loss_details = reconstruction_loss(original, reconstruction)
         loss_rrc, rrc_loss_details = recursive_consistency_loss(params, latent_dist, reconstruction) if RRC_WEIGHT > 0 else (0, {})
 
-        loss = loss_rec + loss_kl + loss_prior + loss_rrc + loss_disc * d_weight
+        loss = loss_rec + loss_kl * COST_KL + loss_prior * COST_PRIOR_DIST + loss_rrc + loss_disc * d_weight
 
         loss_details['loss_obj'] = loss
         loss_details['loss_disc'] = loss_disc
@@ -520,7 +532,7 @@ def train_step(
 
         return loss, (loss_details, reconstruction)
 
-    d_weight = calculate_adaptive_weight(sample_rng)
+    d_weight = calculate_adaptive_weight(sample_rng, latent_dist)
     grad, (loss_details, reconstruction) = compute_loss(
         state.params,
         d_weight,
@@ -621,42 +633,57 @@ def train_step_disc(
 
 # data loader without shuffle, so we can see the progress on the same images
 # Take the first 128 images as validation set
-train_ds = DecoderImageDataset(hfds.select(range(100, len(hfds))), dataset_rng, root=DATA_ROOT) # type: ignore
-test_ds = DecoderImageDataset(hfds.select(range(128)), valset_rng, root=DATA_ROOT) # type: ignore
+# train_ds = DecoderImageDataset(hfds.select(range(128, len(hfds))), jax.device_put(dataset_rng, jax.devices("cpu")[0]), root=DATA_ROOT) # type: ignore
+# test_ds = DecoderImageDataset(hfds.select(range(128)), jax.device_put(valset_rng, jax.devices("cpu")[0]), root=DATA_ROOT) # type: ignore
+# train_ds = DecoderImageDataset(hfds.select(range(128, len(hfds))), dataset_rng, root=DATA_ROOT) # type: ignore
+# test_ds = DecoderImageDataset(hfds.select(range(128)), valset_rng, root=DATA_ROOT) # type: ignore
+
+train_ds = DecoderImageDataset(hfds.select(range(128, len(hfds))), root=DATA_ROOT) # type: ignore
+test_ds = DecoderImageDataset(hfds.select(range(128)), root=DATA_ROOT) # type: ignore
+
+dataloader = JaxBatchDataloader(dataset_rng, BATCH_SIZE, train_ds)
+test_dl = JaxBatchDataloader(valset_rng, BATCH_SIZE, test_ds, only_once=True)
+
 if USE_WANDB:
     wandb.log({"train_dataset_size": len(train_ds)})
 
-dataloader = DataLoader(
-    train_ds,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    collate_fn=partial(DecoderImageDataset.collate_fn, return_names=False),
-    num_workers=16,
-    drop_last=True,
-    prefetch_factor=16,
-    persistent_workers=True
-)
+# def dl_worker_init_fn(worker_id):
+#     import jax
+#     # Set JAX configuration to use CPU
+#     jax.config.update('jax_platform_name', 'cpu')
 
-train_dl_eval = DataLoader(
-    train_ds,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    collate_fn=partial(DecoderImageDataset.collate_fn, return_names=True),
-    num_workers=4,
-    drop_last=True,
-    prefetch_factor=4,
-    persistent_workers=True,
-)
-test_dl = DataLoader(
-    test_ds,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    collate_fn=partial(DecoderImageDataset.collate_fn, return_names=True),
-    num_workers=4,
-    drop_last=True,
-    prefetch_factor=4,
-    persistent_workers=True,
-)
+# dataloader = DataLoader(
+#     train_ds,
+#     batch_size=BATCH_SIZE,
+#     shuffle=True,
+#     collate_fn=partial(DecoderImageDataset.collate_fn, return_names=False),
+#     # num_workers=1,
+#     drop_last=True,
+#     # prefetch_factor=16,
+#     # persistent_workers=True
+# )
+
+# train_dl_eval = DataLoader(
+#     train_ds,
+#     batch_size=BATCH_SIZE,
+#     shuffle=False,
+#     collate_fn=partial(DecoderImageDataset.collate_fn, return_names=True),
+#     # num_workers=1,
+#     drop_last=True,
+#     # prefetch_factor=4,
+#     # persistent_workers=True
+# )
+
+# test_dl = DataLoader(
+#     test_ds,
+#     batch_size=BATCH_SIZE,
+#     shuffle=False,
+#     collate_fn=partial(DecoderImageDataset.collate_fn, return_names=True),
+#     # num_workers=1,
+#     drop_last=True,
+#     # prefetch_factor=4,
+#     # persistent_workers=True
+# )
 
 # evaluation functions
 
@@ -677,7 +704,9 @@ def evaluate(use_tqdm=False, step=None) -> None:
         iterable = test_dl if not use_tqdm else tqdm(test_dl)
         for batch in iterable:
             eval_batches.append(batch)
-            print(f"Reserved {len(eval_batches)} batches for eval.")
+            if len(eval_batches) >= 128//BATCH_SIZE:
+                break
+
     for batch in eval_batches:
         reconstruction = infer_fn(batch, train_state)
         losses.append(optax.l2_loss(reconstruction, batch["original"]).mean())
@@ -691,6 +720,7 @@ def evaluate(use_tqdm=False, step=None) -> None:
         wandb.log({"test_loss": loss}, step=step)
         if TRAIN_EMA:
             wandb.log({"test_loss_ema": loss_ema}, step=step)
+    print(f"done eval")
 
 def postpro(decoded_images: np.ndarray) -> list:
     """util function to postprocess images"""
@@ -703,19 +733,19 @@ def postpro(decoded_images: np.ndarray) -> list:
         for decoded_img in decoded_images
     ]
 
-def log_images(dl: DataLoader, num_images=8, suffix="", step=None) -> None:
+def log_images(batches, num_images=8, suffix="", step=None) -> None:
     logged_images = 0
 
     def batch_gen():
         while True:
-            for batch in dl:
+            for batch in batches:
                 yield batch
 
     batch_iter = batch_gen()
     while logged_images < num_images:
         batch = next(batch_iter) # type: dict
 
-        names = batch.pop("name")
+        names = batch["name"]
         reconstruction = infer_fn(batch, train_state)
         orig_reconstruction = infer_fn_control(batch)
         if TRAIN_EMA:
@@ -733,12 +763,12 @@ def log_images(dl: DataLoader, num_images=8, suffix="", step=None) -> None:
         logged_images += len(images)
 
 def log_test_images(num_images=8, step=None) -> None:
-    log_images(dl=test_dl, num_images=num_images, step=step)
+    log_images(eval_batches, num_images=num_images, step=step)
 
-def log_train_images(num_images=8, step=None) -> None:
-    log_images(
-        dl=train_dl_eval, num_images=num_images, suffix="|train", step=step
-    )
+# def log_train_images(num_images=8, step=None) -> None:
+#     log_images(
+#         dl=train_dl_eval, num_images=num_images, suffix="|train", step=step
+#     )
 
 def save_checkpoint(state: Union[TrainState, TrainStateEma]):
     if USE_WANDB:
@@ -778,20 +808,29 @@ def vae_decode_only(latent: jax.Array):
 
 
 
-dataset = LatentCacheDataset('/mnt/foxhole/vae_latent_cache', 150000, mmap_preload=False)
+# dataset = LatentCacheDataset('/mnt/foxhole/vae_latent_cache', 150000, mmap_preload=False)
 metrics_dict = {}
 metrics_list = []
 steps_since_log = 0
-
-for steps, batch in tqdm(enumerate(dataset), total=len(dataset), desc="Training...", dynamic_ncols=True):
+# import time
+# dataload_time = time.time()
+# dataloading_time_total = 0
+# training_time_total = 0
+for steps, batch in tqdm(enumerate(dataloader), total=TOTAL_STEPS, desc="Training...", dynamic_ncols=True):
+    # print(f"start step {steps}")
     if PROFILE and steps == 100:
         jax.profiler.start_trace("./tensorboard")
-
+    batch["original"] = jax.device_put(batch["original"], jax.devices()[0])
+    # # batch["original"].block_until_ready()
+    # print(f"Dataload time: {time.time() - dataload_time}")
+    # if steps > 5:
+    #     dataloading_time_total = (time.time() - dataload_time) * 0.02 + dataloading_time_total * 0.98
+    # step_time = time.time()
     train_state, training_rng, metrics, fake = train_step(
         train_state,
         training_rng,
         batch["original"],
-        batch["latent_dist"],
+        None, # batch["latent_dist"],
         train_state_disc
     )
 
@@ -805,6 +844,12 @@ for steps, batch in tqdm(enumerate(dataset), total=len(dataset), desc="Training.
     else:
         metrics["disc_step"] = {}
 
+    # # training_rng.block_until_ready()
+    # print(f"Step time: {time.time() - step_time}")
+    # dataload_time = time.time()
+    # if steps > 5:
+    #     training_time_total = (time.time() - step_time) * 0.02 + training_time_total * 0.98
+    #     print(f"Training efficiency: {(training_time_total/(dataloading_time_total+training_time_total))*100}%")
     if PROFILE and steps == 110:
         print(metrics)
         jax.profiler.stop_trace()
@@ -827,8 +872,7 @@ for steps, batch in tqdm(enumerate(dataset), total=len(dataset), desc="Training.
     if steps % EVAL_STEPS == 1:
         evaluate(step=steps)
         log_test_images(step=steps)
-        log_train_images(step=steps)
-
+        # log_train_images(step=steps)
         with Path(output_dir / "latest_state_disc.msgpack").open("wb") as f:
             f.write(to_bytes(jax.device_get(train_state_disc)))
 
