@@ -131,7 +131,7 @@ COST_KL = 1e-4
 # Right now this is MAE between the prior model's latent distribution and the current one,
 # scaled by a sigmoid mask based on the log-variance of the prior model's latent space.
 REPAIR_ENCODER = True
-COST_PRIOR_DIST = 100.0
+COST_PRIOR_DIST = 10000.0
 PRIOR_MASK_EDGE = -24
 PRIOR_MASK_CENTER = -30
 

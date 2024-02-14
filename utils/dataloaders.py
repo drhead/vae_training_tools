@@ -68,7 +68,7 @@ class DecoderImageDataset():
 
         with jax.default_device(jax.devices("cpu")[0]):
             size_rng, crop_rng, fliph_rng, flipw_rng, rot_rng = jax.random.split(rng, 5)
-            img_array = np.array(img, dtype=np.uint8)
+            img_array = np.asarray(img, dtype=np.uint8)
 
             H, W, C = img_array.shape
 
@@ -79,7 +79,7 @@ class DecoderImageDataset():
             cropw = jax.random.randint(cropw_rng, (), 0, W - crop_size).item()
             img_array = img_array[croph:croph+crop_size, cropw:cropw+crop_size]
             # img_array = cv2.resize(img_array, (256, 256), interpolation=cv2.INTER_AREA)
-            img_array = np.array(Image.fromarray(img_array).resize((256, 256), Image.Resampling.LANCZOS, reducing_gap=3.0))
+            img_array = np.asarray(Image.fromarray(img_array).resize((256, 256), Image.Resampling.LANCZOS, reducing_gap=3.0))
 
             # Random flips, both axes
             if jax.random.uniform(fliph_rng) > 0.5:
@@ -91,7 +91,7 @@ class DecoderImageDataset():
             rotate_times = jax.random.randint(rot_rng, (), 0, 3).item()
             img_array = np.rot90(img_array, rotate_times)
             img_array = np.expand_dims(img_array, 0)
-            img_array = jnp.array(img_array, dtype=jnp.bfloat16) / 255 # type: jax.Array
+            img_array = jnp.asarray(img_array, dtype=jnp.bfloat16) / 255 # type: jax.Array
 
         return img_array
 
@@ -120,6 +120,7 @@ class JaxBatchSampler:
             while True:
                 self.rng, shuffle_rng = jax.random.split(self.rng)
                 shuffled_idx = jax.random.permutation(shuffle_rng, jnp.arange(0, self.dataset_len), independent=True)
+                shuffled_idx = np.asarray(shuffled_idx)
 
                 while len(shuffled_idx) >= self.batch_size:
 
