@@ -22,7 +22,7 @@ test_ds = DecoderImageDataset(hfds_val, root=DATA_ROOT) # type: ignore
 train_dl = JaxBatchDataloader(dataset_rng, BATCH_SIZE, train_ds)
 test_dl = JaxBatchDataloader(valset_rng, BATCH_SIZE, test_ds, only_once=True)
 
-for idx, batch in tqdm(enumerate(train_dl), total=TRAIN_CACHE_SIZE, desc="Building image cache...", dynamic_ncols=True):
+for idx, batch in tqdm(enumerate(train_dl), total=TRAIN_CACHE_SIZE, desc="Building image cache (training split)...", dynamic_ncols=True):
     jnp.savez(
         f"{OUTPUT_DIR}/train/batch_{idx}.npz",
         original=batch["original"]
@@ -30,7 +30,7 @@ for idx, batch in tqdm(enumerate(train_dl), total=TRAIN_CACHE_SIZE, desc="Buildi
     if idx == TRAIN_CACHE_SIZE - 1:
         break
 
-for idx, batch in tqdm(enumerate(test_dl), total=len(test_dl), desc="Building image cache...", dynamic_ncols=True):
+for idx, batch in tqdm(enumerate(test_dl), total=len(test_dl), desc="Building image cache (validation split)...", dynamic_ncols=True):
     jnp.savez(
         f"{OUTPUT_DIR}/val/batch_{idx}.npz",
         original=batch["original"]
