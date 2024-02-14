@@ -29,6 +29,7 @@ from flax.training.train_state import TrainState
 from flax.core.frozen_dict import FrozenDict
 import optax
 
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 from PIL import Image
 Image.MAX_IMAGE_PIXELS = None
@@ -131,9 +132,9 @@ COST_KL = 1e-4
 # Right now this is MAE between the prior model's latent distribution and the current one,
 # scaled by a sigmoid mask based on the log-variance of the prior model's latent space.
 REPAIR_ENCODER = True
-COST_PRIOR_DIST = 10000.0
-PRIOR_MASK_EDGE = -24
-PRIOR_MASK_CENTER = -30
+COST_PRIOR_DIST = 100.0
+PRIOR_MASK_EDGE = -22
+PRIOR_MASK_CENTER = -26
 
 # I highly recommend starting from "stabilityai/sd-vae-ft-mse" if using this for a SD1.5/2.1 decoder finetune.
 # It is much better trained than the stock kl-f8 autoencoder from SD 1.5 and losses starting out will likely be lower.
@@ -264,6 +265,17 @@ def reconstruct(params: Union[dict, FrozenDict], original: jax.Array) -> jax.Arr
     ) # type: FlaxDecoderOutput
     return from_decoder(decoder_out.sample)
 
+@jax.jit
+def get_latent_dist(params: Union[dict, FrozenDict], original: jax.Array) -> Tuple[jax.Array, jax.Array]:
+    latent_dist = vae.apply( # type: ignore
+        {"params": params},
+        to_encoder(original),
+        deterministic=False,
+        return_dict=False,
+        method=vae.encode
+    )[0] # type: FlaxDiagonalGaussianDistribution
+    return latent_dist.mean, latent_dist.logvar
+
 @partial(jax.jit, donate_argnums=(0, 1))
 def train_step(
     state: TrainState,
@@ -315,15 +327,26 @@ def train_step(
         else:
             prior_latents = cached_latents
 
+        # # Compute difference between the current latents and the prior latents.
+        # # A good repair keeps the latent space mostly the same.
+        # mae_prior = jnp.abs(current_latents.mode() - prior_latents.mode())
+
+        # # However, we do want to allow the latent space to change a lot under the logvar defects.
+        # mae_mask = sigmoid_mask(prior_latents.logvar, PRIOR_MASK_EDGE, PRIOR_MASK_CENTER, 1)
+
+        # # Apply the mask and scale down loss by the size of the latent space.
+        # loss_prior = jnp.mean(mae_prior * mae_mask)
+
         # Compute difference between the current latents and the prior latents.
         # A good repair keeps the latent space mostly the same.
-        mae_prior = jnp.abs(current_latents.mode() - prior_latents.mode())
+        l2_prior = optax.l2_loss(current_latents.mode(), prior_latents.mode())
 
         # However, we do want to allow the latent space to change a lot under the logvar defects.
-        mae_mask = sigmoid_mask(prior_latents.logvar, PRIOR_MASK_EDGE, PRIOR_MASK_CENTER, 1)
+        l2_mask = sigmoid_mask(prior_latents.logvar, PRIOR_MASK_EDGE, PRIOR_MASK_CENTER, 1)
 
         # Apply the mask and scale down loss by the size of the latent space.
-        loss_prior = jnp.mean(mae_prior * mae_mask)
+        loss_prior = jnp.mean(l2_prior * l2_mask)
+        
 
         return current_latents, (loss_kl, loss_prior)
 
@@ -633,11 +656,6 @@ def train_step_disc(
 
 # data loader without shuffle, so we can see the progress on the same images
 # Take the first 128 images as validation set
-# train_ds = DecoderImageDataset(hfds.select(range(128, len(hfds))), jax.device_put(dataset_rng, jax.devices("cpu")[0]), root=DATA_ROOT) # type: ignore
-# test_ds = DecoderImageDataset(hfds.select(range(128)), jax.device_put(valset_rng, jax.devices("cpu")[0]), root=DATA_ROOT) # type: ignore
-# train_ds = DecoderImageDataset(hfds.select(range(128, len(hfds))), dataset_rng, root=DATA_ROOT) # type: ignore
-# test_ds = DecoderImageDataset(hfds.select(range(128)), valset_rng, root=DATA_ROOT) # type: ignore
-
 train_ds = DecoderImageDataset(hfds.select(range(128, len(hfds))), root=DATA_ROOT) # type: ignore
 test_ds = DecoderImageDataset(hfds.select(range(128)), root=DATA_ROOT) # type: ignore
 
@@ -647,48 +665,18 @@ test_dl = JaxBatchDataloader(valset_rng, BATCH_SIZE, test_ds, only_once=True)
 if USE_WANDB:
     wandb.log({"train_dataset_size": len(train_ds)})
 
-# def dl_worker_init_fn(worker_id):
-#     import jax
-#     # Set JAX configuration to use CPU
-#     jax.config.update('jax_platform_name', 'cpu')
-
-# dataloader = DataLoader(
-#     train_ds,
-#     batch_size=BATCH_SIZE,
-#     shuffle=True,
-#     collate_fn=partial(DecoderImageDataset.collate_fn, return_names=False),
-#     # num_workers=1,
-#     drop_last=True,
-#     # prefetch_factor=16,
-#     # persistent_workers=True
-# )
-
-# train_dl_eval = DataLoader(
-#     train_ds,
-#     batch_size=BATCH_SIZE,
-#     shuffle=False,
-#     collate_fn=partial(DecoderImageDataset.collate_fn, return_names=True),
-#     # num_workers=1,
-#     drop_last=True,
-#     # prefetch_factor=4,
-#     # persistent_workers=True
-# )
-
-# test_dl = DataLoader(
-#     test_ds,
-#     batch_size=BATCH_SIZE,
-#     shuffle=False,
-#     collate_fn=partial(DecoderImageDataset.collate_fn, return_names=True),
-#     # num_workers=1,
-#     drop_last=True,
-#     # prefetch_factor=4,
-#     # persistent_workers=True
-# )
-
 # evaluation functions
 
 def infer_fn(batch: dict, state: TrainState) -> jax.Array:
     return reconstruct(state.params, batch["original"])
+
+def infer_fn_get_latent_dist(batch: dict, state: TrainState) -> FlaxDiagonalGaussianDistribution:
+    mean, logvar = get_latent_dist(state.params, batch["original"])
+    return FlaxDiagonalGaussianDistribution(jnp.concatenate([mean, logvar], axis=-1))
+
+def infer_fn_get_prior_latent_dist(batch: dict) -> FlaxDiagonalGaussianDistribution:
+    mean, logvar = get_latent_dist(prior_params, batch["original"])
+    return FlaxDiagonalGaussianDistribution(jnp.concatenate([mean, logvar], axis=-1))
 
 def infer_fn_ema(batch: dict, state: TrainStateEma) -> jax.Array:
     return reconstruct(state.ema_params, batch["original"])
@@ -748,6 +736,14 @@ def log_images(batches, num_images=8, suffix="", step=None) -> None:
         names = batch["name"]
         reconstruction = infer_fn(batch, train_state)
         orig_reconstruction = infer_fn_control(batch)
+        if TRAIN_ENCODER:
+            current_latent_dist = infer_fn_get_latent_dist(batch, train_state)
+            current_logvars = np.split(current_latent_dist.logvar.astype(jnp.float32), current_latent_dist.logvar.shape[0], axis=0)
+            if REPAIR_ENCODER:
+                prior_latent_dist = infer_fn_get_prior_latent_dist(batch)
+                prior_logvars = np.split(prior_latent_dist.logvar.astype(jnp.float32), prior_latent_dist.logvar.shape[0], axis=0)
+                mean_dist_shift = current_latent_dist.mean.astype(jnp.float32) - prior_latent_dist.mean.astype(jnp.float32)
+                mean_dist_shift = np.split(mean_dist_shift, mean_dist_shift.shape[0], axis=0)
         if TRAIN_EMA:
             reconstruction_ema = infer_fn_ema(batch, train_state)
             left_right = np.concatenate([batch["original"], orig_reconstruction, reconstruction, reconstruction_ema], axis=2)
@@ -756,10 +752,36 @@ def log_images(batches, num_images=8, suffix="", step=None) -> None:
 
         images = postpro(left_right)
         if USE_WANDB:
-            for name, image in zip(names, images):
+            for idx, (name, image) in enumerate(zip(names, images)):
                 wandb.log(
                     {f"{name}{suffix}": wandb.Image(image, caption=name)}, step=step
                 )
+                if TRAIN_ENCODER:
+                    image = current_logvars[idx][0]
+                    square_latent = np.concatenate([image[:, :, 0:2], image[:, :, 2:4]], axis=0)
+                    square_latent = np.concatenate([square_latent[:, :, 0], square_latent[:, :, 1]], axis=1)
+                    fig, ax = plt.subplots(figsize=(4, 4), dpi=256)
+                    im = ax.imshow(square_latent, cmap='plasma')
+                    cbar = plt.colorbar(im, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
+                    wandb.log({f"Latent Space/{name}-logvar-current": wandb.Image(fig)}, step=step)
+                    plt.close()
+                    if REPAIR_ENCODER:
+                        image = prior_logvars[idx][0]
+                        square_latent = np.concatenate([image[:, :, 0:2], image[:, :, 2:4]], axis=0)
+                        square_latent = np.concatenate([square_latent[:, :, 0], square_latent[:, :, 1]], axis=1)
+                        fig, ax = plt.subplots(figsize=(4, 4), dpi=256)
+                        im = ax.imshow(square_latent, cmap='plasma')
+                        cbar = plt.colorbar(im, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
+                        wandb.log({f"Latent Space/{name}-logvar-prior": wandb.Image(fig)}, step=step)
+                        plt.close()
+                        image = mean_dist_shift[idx][0]
+                        square_latent = np.concatenate([image[:, :, 0:2], image[:, :, 2:4]], axis=0)
+                        square_latent = np.concatenate([square_latent[:, :, 0], square_latent[:, :, 1]], axis=1)
+                        fig, ax = plt.subplots(figsize=(4, 4), dpi=256)
+                        im = ax.imshow(square_latent, cmap='plasma')
+                        cbar = plt.colorbar(im, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
+                        wandb.log({f"Latent Space/{name}-mean-dist-shift": wandb.Image(fig)}, step=step)
+                        plt.close()
         logged_images += len(images)
 
 def log_test_images(num_images=8, step=None) -> None:
