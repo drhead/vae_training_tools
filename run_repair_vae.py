@@ -132,9 +132,12 @@ COST_KL = 1e-5
 # Right now this is MAE between the prior model's latent distribution and the current one,
 # scaled by a sigmoid mask based on the log-variance of the prior model's latent space.
 REPAIR_ENCODER = True
-COST_PRIOR_DIST = 100.0
-PRIOR_MASK_EDGE = -22
-PRIOR_MASK_CENTER = -26
+COST_PRIOR_MEAN = 100.0
+PRIOR_MEAN_MASK_EDGE = -22
+PRIOR_MEAN_MASK_CENTER = -26
+COST_PRIOR_LOGVAR = 100.0
+PRIOR_LOGVAR_MASK_EDGE = -12
+PRIOR_LOGVAR_MASK_CENTER = -14
 
 # I highly recommend starting from "stabilityai/sd-vae-ft-mse" if using this for a SD1.5/2.1 decoder finetune.
 # It is much better trained than the stock kl-f8 autoencoder from SD 1.5 and losses starting out will likely be lower.
@@ -355,15 +358,17 @@ def train_step(
 
         # Compute difference between the current latents and the prior latents.
         # A good repair keeps the latent space mostly the same.
-        l2_prior = optax.l2_loss(current_latents.mode(), prior_latents.mode())
+        loss_mean_prior = optax.l2_loss(current_latents.mode(), prior_latents.mode())
+        loss_mean_mask = sigmoid_mask(prior_latents.logvar, PRIOR_MEAN_MASK_EDGE, PRIOR_MEAN_MASK_CENTER, 1)
 
-        # However, we do want to allow the latent space to change a lot under the logvar defects.
-        l2_mask = sigmoid_mask(prior_latents.logvar, PRIOR_MASK_EDGE, PRIOR_MASK_CENTER, 1)
+        loss_logvar_prior = jnp.abs(current_latents.logvar, prior_latents.logvar)
+        loss_logvar_mask = sigmoid_mask(prior_latents.logvar, PRIOR_LOGVAR_MASK_EDGE, PRIOR_LOGVAR_MASK_CENTER, 1)
 
         # Apply the mask and scale down loss by the size of the latent space.
-        loss_prior = jnp.mean(l2_prior * l2_mask)
+        loss_mean = jnp.mean(loss_mean_prior * loss_mean_mask)
+        loss_logvar = jnp.mean(loss_logvar_prior * loss_logvar_mask)
 
-        return current_latents, (loss_kl, loss_prior)
+        return current_latents, (loss_kl, loss_mean, loss_logvar)
 
     def discriminator_loss(reconstruction):
         disc_fake_scores = state_disc.apply_fn(
@@ -533,7 +538,7 @@ def train_step(
         original: jax.Array,
         sample_rng: jax.Array
     ):
-        latent_dist, (loss_kl, loss_prior) = encoder_loss(params, latent_dist)
+        latent_dist, (loss_kl, loss_prior_mean, loss_prior_logvar) = encoder_loss(params, latent_dist)
 
         decoder_out = vae.apply( # type: ignore
             {"params": params},
@@ -547,7 +552,14 @@ def train_step(
         loss_rec, loss_details = reconstruction_loss(original, reconstruction)
         loss_rrc, rrc_loss_details = recursive_consistency_loss(params, latent_dist, reconstruction) if RRC_WEIGHT > 0 else (0, {})
 
-        loss = loss_rec + loss_kl * COST_KL + loss_prior * COST_PRIOR_DIST + loss_rrc + loss_disc * d_weight
+        loss = (
+            loss_rec +
+            loss_kl * COST_KL +
+            loss_prior_mean * COST_PRIOR_MEAN +
+            loss_prior_logvar * COST_PRIOR_LOGVAR +
+            loss_rrc +
+            loss_disc * d_weight
+        )
 
         loss_details['loss_obj'] = loss
         loss_details['loss_disc'] = loss_disc
@@ -561,7 +573,8 @@ def train_step(
             loss_details['loss_kl'] = loss_kl
 
         if TRAIN_ENCODER and REPAIR_ENCODER:
-            loss_details['loss_prior'] = loss_prior
+            loss_details['loss_prior_mean'] = loss_prior_mean
+            loss_details['loss_prior_logvar'] = loss_prior_logvar
 
         return loss, (loss_details, reconstruction)
 
