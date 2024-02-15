@@ -46,7 +46,7 @@ from utils.loss_functions import compute_kc_loss_lab, srgb_to_oklab, sigmoid_mas
 USE_WANDB = True
 PROFILE = False
 
-TRAIN_EMA = True
+TRAIN_EMA = False
 EMA_DECAY = (1 - 0.001 / 6) # ~0.99983, EMA decay value used for sd-vae-ft adjusted for batch
 # paths and configs
 if USE_WANDB:
@@ -100,7 +100,7 @@ output_dir.mkdir(exist_ok=True)
 # loss value weights
 # reconstruction losses -- current weights match LDM/SD-VAE-FT values
 COST_L1 = 1.0
-COST_L2 = 10.0
+COST_L2 = 0 # 10.0
 COST_LPIPS = 1.0
 
 # kurtosis concentration loss, for more natural images
@@ -122,7 +122,7 @@ RRC_LATENT = False # Compute the RRC loss in latent space, instead of pixel spac
 TRAIN_ENCODER = True
 
 # KL regularization. CompVis used a small amount (1e-6). It probably should be higher.
-COST_KL = 1e-4
+COST_KL = 1e-5
 
 # What should hopefully make repair of the VAE feasible.
 # Compvis KL-F8's anomaly is believed to be a spot the model learned to blow out in order
@@ -151,6 +151,7 @@ vae = vae # type: FlaxAutoencoderKL
 # make a copy of the original VAE so we can compare its outputs to our trained model periodically
 prior_params = deepcopy(vae_params)
 # don't forget to place it on the accelerator
+vae_params = jax.device_put(vae_params, jax.devices()[0])
 prior_params = jax.device_put(prior_params, jax.devices()[0])
 
 disc_model = NLayerDiscriminator(
@@ -182,7 +183,9 @@ lr_schedule = optax.join_schedules(
 )
 
 # Cosine down from 1 to 0 over the course of the run, for switching from L1 to L2 gradually
-l1_loss_schedule = optax.cosine_decay_schedule(1.0, L1_L2_SWITCH_STEPS, 0.6)
+# for repair run it is constant
+# l1_loss_schedule = optax.cosine_decay_schedule(1.0, L1_L2_SWITCH_STEPS, 0.6)
+l1_loss_schedule = optax.constant_schedule(1)
 
 disc_loss_skip_schedule = optax.join_schedules(
     schedules=[
@@ -260,17 +263,31 @@ def reconstruct(params: Union[dict, FrozenDict], original: jax.Array) -> jax.Arr
     decoder_out = vae.apply( # type: ignore
         {"params": params},
         to_encoder(original),
-        sample_posterior=False,
-        deterministic=True
+        sample_posterior=False
     ) # type: FlaxDecoderOutput
     return from_decoder(decoder_out.sample)
+
+@jax.jit
+def cross_reconstruct(encoder_params: Union[dict, FrozenDict], decoder_params: Union[dict, FrozenDict], original: jax.Array) -> jax.Array:
+    latent_dist = vae.apply( # type: ignore
+        {"params": encoder_params},
+        to_encoder(original),
+        return_dict=False,
+        method=vae.encode
+    )[0] # type: FlaxDiagonalGaussianDistribution
+    decoder_out = vae.apply( # type: ignore
+        {"params": decoder_params},
+        latent_dist.mode(),
+        return_dict=False,
+        method=vae.decode
+    )[0] # type: jax.Array
+    return from_decoder(decoder_out)
 
 @jax.jit
 def get_latent_dist(params: Union[dict, FrozenDict], original: jax.Array) -> Tuple[jax.Array, jax.Array]:
     latent_dist = vae.apply( # type: ignore
         {"params": params},
         to_encoder(original),
-        deterministic=False,
         return_dict=False,
         method=vae.encode
     )[0] # type: FlaxDiagonalGaussianDistribution
@@ -282,7 +299,8 @@ def train_step(
     train_rng: jax.Array,
     original: jax.Array,
     latent_dist: Union[FlaxDiagonalGaussianDistribution, None],
-    state_disc: TrainState
+    state_disc: TrainState,
+    prior_vae_params: dict
 ) -> Tuple[TrainState, jax.Array, dict, jax.Array]:
     dropout_rng, sample_rng, new_train_rng = jax.random.split(train_rng, 3)
 
@@ -298,7 +316,6 @@ def train_step(
         current_latents = vae.apply( # type: ignore
             {"params": params},
             to_encoder(original),
-            deterministic=False,
             return_dict=False,
             method=vae.encode
         )[0] # type: FlaxDiagonalGaussianDistribution
@@ -318,9 +335,8 @@ def train_step(
         # If we don't have the prior latents cached, generate them.
         if cached_latents is None:
             prior_latents = vae.apply( # type: ignore
-                {"params": prior_params},
+                {"params": prior_vae_params},
                 to_encoder(original),
-                deterministic=False,
                 return_dict=False,
                 method=vae.encode
             )[0] # type: FlaxDiagonalGaussianDistribution
@@ -346,7 +362,6 @@ def train_step(
 
         # Apply the mask and scale down loss by the size of the latent space.
         loss_prior = jnp.mean(l2_prior * l2_mask)
-        
 
         return current_latents, (loss_kl, loss_prior)
 
@@ -401,8 +416,7 @@ def train_step(
         decoder_out = vae.apply( # type: ignore
             {"params": params},
             to_encoder(reconstruction),
-            sample_posterior=False,
-            deterministic=True
+            sample_posterior=False
         ) # type: FlaxDecoderOutput
 
         rec_loss, rec_loss_details = reconstruction_loss(
@@ -417,7 +431,6 @@ def train_step(
             {"params": params},
             to_encoder(reconstruction),
             sample_posterior=False,
-            deterministic=True,
             method=vae.encode
         )[0]
 
@@ -449,7 +462,6 @@ def train_step(
             decoder_out = vae.apply( # type: ignore
                 {"params": params},
                 latent_dist.sample(sample_rng),
-                deterministic=False,
                 return_dict=False,
                 method=vae.decode
             )[0] # type: FlaxDecoderOutput
@@ -488,7 +500,6 @@ def train_step(
             latent_dist = vae.apply( # type: ignore
                 {"params": state.params},
                 to_encoder(original),
-                deterministic=False,
                 return_dict=False,
                 method=vae.encode
             )[0] # type: FlaxDiagonalGaussianDistribution
@@ -527,7 +538,6 @@ def train_step(
         decoder_out = vae.apply( # type: ignore
             {"params": params},
             latent_dist.sample(sample_rng),
-            deterministic=False,
             return_dict=False,
             method=vae.decode
         )[0] # type: FlaxDecoderOutput
@@ -739,16 +749,21 @@ def log_images(batches, num_images=8, suffix="", step=None) -> None:
         if TRAIN_ENCODER:
             current_latent_dist = infer_fn_get_latent_dist(batch, train_state)
             current_logvars = np.split(current_latent_dist.logvar.astype(jnp.float32), current_latent_dist.logvar.shape[0], axis=0)
+            current_means = np.split(current_latent_dist.mean.astype(jnp.float32), current_latent_dist.mean.shape[0], axis=0)
             if REPAIR_ENCODER:
                 prior_latent_dist = infer_fn_get_prior_latent_dist(batch)
                 prior_logvars = np.split(prior_latent_dist.logvar.astype(jnp.float32), prior_latent_dist.logvar.shape[0], axis=0)
+                prior_means = np.split(prior_latent_dist.mean.astype(jnp.float32), prior_latent_dist.mean.shape[0], axis=0)
                 mean_dist_shift = current_latent_dist.mean.astype(jnp.float32) - prior_latent_dist.mean.astype(jnp.float32)
                 mean_dist_shift = np.split(mean_dist_shift, mean_dist_shift.shape[0], axis=0)
+                recon_orig_encoder = cross_reconstruct(prior_params, train_state.params, batch["original"])
+                recon_orig_decoder = cross_reconstruct(train_state.params, prior_params, batch["original"])
+
         if TRAIN_EMA:
             reconstruction_ema = infer_fn_ema(batch, train_state)
             left_right = np.concatenate([batch["original"], orig_reconstruction, reconstruction, reconstruction_ema], axis=2)
         else:
-            left_right = np.concatenate([batch["original"], orig_reconstruction, reconstruction], axis=2)
+            left_right = np.concatenate([batch["original"], orig_reconstruction, reconstruction, recon_orig_encoder, recon_orig_decoder], axis=2)
 
         images = postpro(left_right)
         if USE_WANDB:
@@ -764,6 +779,14 @@ def log_images(batches, num_images=8, suffix="", step=None) -> None:
                     im = ax.imshow(square_latent, cmap='plasma')
                     cbar = plt.colorbar(im, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
                     wandb.log({f"Latent Space/{name}-logvar-current": wandb.Image(fig)}, step=step)
+                    plt.close()
+                    image = current_means[idx][0]
+                    square_latent = np.concatenate([image[:, :, 0:2], image[:, :, 2:4]], axis=0)
+                    square_latent = np.concatenate([square_latent[:, :, 0], square_latent[:, :, 1]], axis=1)
+                    fig, ax = plt.subplots(figsize=(4, 4), dpi=256)
+                    im = ax.imshow(square_latent, cmap='plasma')
+                    cbar = plt.colorbar(im, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
+                    wandb.log({f"Latent Space/{name}-mean-current": wandb.Image(fig)}, step=step)
                     plt.close()
                     if REPAIR_ENCODER:
                         image = prior_logvars[idx][0]
@@ -781,6 +804,14 @@ def log_images(batches, num_images=8, suffix="", step=None) -> None:
                         im = ax.imshow(square_latent, cmap='plasma')
                         cbar = plt.colorbar(im, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
                         wandb.log({f"Latent Space/{name}-mean-dist-shift": wandb.Image(fig)}, step=step)
+                        plt.close()
+                        image = prior_means[idx][0]
+                        square_latent = np.concatenate([image[:, :, 0:2], image[:, :, 2:4]], axis=0)
+                        square_latent = np.concatenate([square_latent[:, :, 0], square_latent[:, :, 1]], axis=1)
+                        fig, ax = plt.subplots(figsize=(4, 4), dpi=256)
+                        im = ax.imshow(square_latent, cmap='plasma')
+                        cbar = plt.colorbar(im, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
+                        wandb.log({f"Latent Space/{name}-mean-prior": wandb.Image(fig)}, step=step)
                         plt.close()
         logged_images += len(images)
 
@@ -808,7 +839,6 @@ def encode_latent_for_cache(original: jax.Array):
     posterior = vae.apply( # type: ignore
         {"params": train_state.params},
         to_encoder(original),
-        deterministic=False,
         method=vae.encode
     ) # type: FlaxAutoencoderKLOutput
     batch = {
@@ -822,7 +852,6 @@ def vae_decode_only(latent: jax.Array):
     decoder_out = vae.apply( # type: ignore
         {"params": vae_params},
         latent,
-        deterministic=False,
         method=vae.decode
     ) # type: FlaxDecoderOutput
 
@@ -853,7 +882,8 @@ for steps, batch in tqdm(enumerate(dataloader), total=TOTAL_STEPS, desc="Trainin
         training_rng,
         batch["original"],
         None, # batch["latent_dist"],
-        train_state_disc
+        train_state_disc,
+        prior_params
     )
 
     if disc_loss_skip_schedule(train_state.step) > 0:
