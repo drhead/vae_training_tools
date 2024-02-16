@@ -122,7 +122,7 @@ RRC_LATENT = False # Compute the RRC loss in latent space, instead of pixel spac
 TRAIN_ENCODER = True
 
 # KL regularization. CompVis used a small amount (1e-6). It probably should be higher.
-COST_KL = 1e-5
+COST_KL = 1e-4
 
 # What should hopefully make repair of the VAE feasible.
 # Compvis KL-F8's anomaly is believed to be a spot the model learned to blow out in order
@@ -361,7 +361,7 @@ def train_step(
         loss_mean_prior = optax.l2_loss(current_latents.mode(), prior_latents.mode())
         loss_mean_mask = sigmoid_mask(prior_latents.logvar, PRIOR_MEAN_MASK_EDGE, PRIOR_MEAN_MASK_CENTER, 1)
 
-        loss_logvar_prior = jnp.abs(current_latents.logvar, prior_latents.logvar)
+        loss_logvar_prior = jnp.abs(current_latents.logvar - prior_latents.logvar)
         loss_logvar_mask = sigmoid_mask(prior_latents.logvar, PRIOR_LOGVAR_MASK_EDGE, PRIOR_LOGVAR_MASK_CENTER, 1)
 
         # Apply the mask and scale down loss by the size of the latent space.
