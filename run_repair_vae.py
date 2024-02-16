@@ -132,12 +132,16 @@ COST_KL = 1e-4
 # Right now this is MAE between the prior model's latent distribution and the current one,
 # scaled by a sigmoid mask based on the log-variance of the prior model's latent space.
 REPAIR_ENCODER = True
+
 COST_PRIOR_MEAN = 100.0
 PRIOR_MEAN_MASK_EDGE = -22
 PRIOR_MEAN_MASK_CENTER = -26
-COST_PRIOR_LOGVAR = 100.0
-PRIOR_LOGVAR_MASK_EDGE = -12
-PRIOR_LOGVAR_MASK_CENTER = -14
+
+COST_PRIOR_LOGVAR = 75.0
+PRIOR_LOGVAR_MASK_LEFT_CENTER = -14
+PRIOR_LOGVAR_MASK_LEFT_EDGE = -12
+PRIOR_LOGVAR_MASK_RIGHT_EDGE = -6
+PRIOR_LOGVAR_MASK_RIGHT_CENTER = -4
 
 # I highly recommend starting from "stabilityai/sd-vae-ft-mse" if using this for a SD1.5/2.1 decoder finetune.
 # It is much better trained than the stock kl-f8 autoencoder from SD 1.5 and losses starting out will likely be lower.
@@ -362,7 +366,10 @@ def train_step(
         loss_mean_mask = sigmoid_mask(prior_latents.logvar, PRIOR_MEAN_MASK_EDGE, PRIOR_MEAN_MASK_CENTER, 1)
 
         loss_logvar_prior = jnp.abs(current_latents.logvar - prior_latents.logvar)
-        loss_logvar_mask = sigmoid_mask(prior_latents.logvar, PRIOR_LOGVAR_MASK_EDGE, PRIOR_LOGVAR_MASK_CENTER, 1)
+        loss_logvar_mask = (
+            sigmoid_mask(prior_latents.logvar, PRIOR_LOGVAR_MASK_LEFT_EDGE, PRIOR_LOGVAR_MASK_LEFT_CENTER, 1) *
+            sigmoid_mask(prior_latents.logvar, PRIOR_LOGVAR_MASK_RIGHT_EDGE, PRIOR_LOGVAR_MASK_RIGHT_CENTER, 1)
+        )
 
         # Apply the mask and scale down loss by the size of the latent space.
         loss_mean = jnp.mean(loss_mean_prior * loss_mean_mask)
