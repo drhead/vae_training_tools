@@ -122,7 +122,7 @@ RRC_LATENT = False # Compute the RRC loss in latent space, instead of pixel spac
 TRAIN_ENCODER = True
 
 # KL regularization. CompVis used a small amount (1e-6). It probably should be higher.
-COST_KL = 1e-4
+COST_KL = 2e-4
 
 # What should hopefully make repair of the VAE feasible.
 # Compvis KL-F8's anomaly is believed to be a spot the model learned to blow out in order
@@ -138,10 +138,7 @@ PRIOR_MEAN_MASK_EDGE = -22
 PRIOR_MEAN_MASK_CENTER = -26
 
 COST_PRIOR_LOGVAR = 75.0
-PRIOR_LOGVAR_MASK_LEFT_CENTER = -14
-PRIOR_LOGVAR_MASK_LEFT_EDGE = -12
-PRIOR_LOGVAR_MASK_RIGHT_EDGE = -6
-PRIOR_LOGVAR_MASK_RIGHT_CENTER = -4
+PRIOR_LOGVAR_CLIP = (-18, -6)
 
 # I highly recommend starting from "stabilityai/sd-vae-ft-mse" if using this for a SD1.5/2.1 decoder finetune.
 # It is much better trained than the stock kl-f8 autoencoder from SD 1.5 and losses starting out will likely be lower.
@@ -350,30 +347,15 @@ def train_step(
         else:
             prior_latents = cached_latents
 
-        # # Compute difference between the current latents and the prior latents.
-        # # A good repair keeps the latent space mostly the same.
-        # mae_prior = jnp.abs(current_latents.mode() - prior_latents.mode())
-
-        # # However, we do want to allow the latent space to change a lot under the logvar defects.
-        # mae_mask = sigmoid_mask(prior_latents.logvar, PRIOR_MASK_EDGE, PRIOR_MASK_CENTER, 1)
-
-        # # Apply the mask and scale down loss by the size of the latent space.
-        # loss_prior = jnp.mean(mae_prior * mae_mask)
-
         # Compute difference between the current latents and the prior latents.
         # A good repair keeps the latent space mostly the same.
         loss_mean_prior = optax.l2_loss(current_latents.mode(), prior_latents.mode())
         loss_mean_mask = sigmoid_mask(prior_latents.logvar, PRIOR_MEAN_MASK_EDGE, PRIOR_MEAN_MASK_CENTER, 1)
-
-        loss_logvar_prior = jnp.abs(current_latents.logvar - prior_latents.logvar)
-        loss_logvar_mask = (
-            sigmoid_mask(prior_latents.logvar, PRIOR_LOGVAR_MASK_LEFT_EDGE, PRIOR_LOGVAR_MASK_LEFT_CENTER, 1) *
-            sigmoid_mask(prior_latents.logvar, PRIOR_LOGVAR_MASK_RIGHT_EDGE, PRIOR_LOGVAR_MASK_RIGHT_CENTER, 1)
-        )
+        loss_logvar_prior = jnp.abs(current_latents.logvar - jnp.clip(prior_latents.logvar, PRIOR_LOGVAR_CLIP[0], PRIOR_LOGVAR_CLIP[1]))
 
         # Apply the mask and scale down loss by the size of the latent space.
         loss_mean = jnp.mean(loss_mean_prior * loss_mean_mask)
-        loss_logvar = jnp.mean(loss_logvar_prior * loss_logvar_mask)
+        loss_logvar = jnp.mean(loss_logvar_prior)
 
         return current_latents, (loss_kl, loss_mean, loss_logvar)
 
