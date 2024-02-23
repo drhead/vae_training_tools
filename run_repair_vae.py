@@ -131,15 +131,15 @@ COST_KL = 5e-4
 # effectively as a rescaled version of the prior should in theory solve the issue while
 # making the new distribution easy to generalize over based on the prior.
 # Right now this is MAE between the prior model's latent distribution and the current one,
-# scaled by a sigmoid mask based on the log-variance of the prior model's latent space.
+# scaled by a mask based on the log-variance of the prior model's latent space.
 REPAIR_ENCODER = True
 
 COST_PRIOR_MEAN = 20.0
-PRIOR_MEAN_MASK_EDGE = -20
-PRIOR_MEAN_MASK_CENTER = -24
+COST_PRIOR_LOGVAR = 10.0
+COST_CLIP_LOGVAR = 10.0
 
-COST_PRIOR_LOGVAR = 15.0
-PRIOR_LOGVAR_CLIP = (-18, -4)
+LOGVAR_MIN = -20
+LOGVAR_MAX = 0
 
 # I highly recommend starting from "stabilityai/sd-vae-ft-mse" if using this for a SD1.5/2.1 decoder finetune.
 # It is much better trained than the stock kl-f8 autoencoder from SD 1.5 and losses starting out will likely be lower.
@@ -348,17 +348,21 @@ def train_step(
         else:
             prior_latents = cached_latents
 
+
         # Compute difference between the current latents and the prior latents.
         # A good repair keeps the latent space mostly the same.
-        loss_mean_prior = optax.l2_loss(current_latents.mode(), prior_latents.mode())
-        loss_mean_mask = sigmoid_mask(prior_latents.logvar, PRIOR_MEAN_MASK_EDGE, PRIOR_MEAN_MASK_CENTER, 1)
-        loss_logvar_prior = jnp.abs(current_latents.logvar - jnp.clip(prior_latents.logvar, PRIOR_LOGVAR_CLIP[0], PRIOR_LOGVAR_CLIP[1]))
 
-        # Apply the mask and scale down loss by the size of the latent space.
-        loss_mean = jnp.mean(loss_mean_prior * loss_mean_mask)
-        loss_logvar = jnp.mean(loss_logvar_prior)
+        logvar_mask = (prior_latents.logvar > LOGVAR_MIN) * (prior_latents.logvar < LOGVAR_MAX)
+        loss_mean_prior = optax.l2_loss(current_latents.mode(), prior_latents.mode()) * logvar_mask
+        loss_logvar_prior = jnp.abs(current_latents.logvar - prior_latents.logvar) * logvar_mask
+        loss_logvar_clip = jnp.min(current_latents.logvar - LOGVAR_MAX, 0) + jnp.max(LOGVAR_MIN - current_latents.logvar, 0)
 
-        return current_latents, (loss_kl, loss_mean, loss_logvar)
+        return current_latents, (
+            loss_kl,
+            jnp.mean(loss_mean_prior),
+            jnp.mean(loss_logvar_prior),
+            jnp.mean(loss_logvar_clip)
+        )
 
     def discriminator_loss(reconstruction):
         disc_fake_scores = state_disc.apply_fn(
@@ -528,7 +532,7 @@ def train_step(
         original: jax.Array,
         sample_rng: jax.Array
     ):
-        latent_dist, (loss_kl, loss_prior_mean, loss_prior_logvar) = encoder_loss(params, latent_dist)
+        latent_dist, (loss_kl, loss_prior_mean, loss_prior_logvar, loss_clip_logvar) = encoder_loss(params, latent_dist)
 
         decoder_out = vae.apply( # type: ignore
             {"params": params},
@@ -547,6 +551,7 @@ def train_step(
             loss_kl * COST_KL +
             loss_prior_mean * COST_PRIOR_MEAN +
             loss_prior_logvar * COST_PRIOR_LOGVAR +
+            loss_clip_logvar * COST_CLIP_LOGVAR +
             loss_rrc +
             loss_disc * d_weight
         )
@@ -565,6 +570,7 @@ def train_step(
         if TRAIN_ENCODER and REPAIR_ENCODER:
             loss_details['loss_prior_mean'] = loss_prior_mean
             loss_details['loss_prior_logvar'] = loss_prior_logvar
+            loss_details['loss_clip_logvar'] = loss_clip_logvar
 
         return loss, (loss_details, reconstruction)
 
