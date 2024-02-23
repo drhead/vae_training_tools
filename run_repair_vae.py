@@ -355,7 +355,7 @@ def train_step(
         logvar_mask = (prior_latents.logvar > LOGVAR_MIN) * (prior_latents.logvar < LOGVAR_MAX)
         loss_mean_prior = optax.l2_loss(current_latents.mode(), prior_latents.mode()) * logvar_mask
         loss_logvar_prior = jnp.abs(current_latents.logvar - prior_latents.logvar) * logvar_mask
-        loss_logvar_clip = jnp.min(current_latents.logvar - LOGVAR_MAX, 0) + jnp.max(LOGVAR_MIN - current_latents.logvar, 0)
+        loss_logvar_clip = jnp.max(current_latents.logvar - LOGVAR_MAX, 0) + jnp.max(LOGVAR_MIN - current_latents.logvar, 0)
 
         return current_latents, (
             loss_kl,
