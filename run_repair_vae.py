@@ -54,8 +54,9 @@ if USE_WANDB:
 
 # cards supporting bfloat16 can easily support batches of 16 for every 20GB or so
 # recommend raising in increments of 8 until it OOMs then take a step back
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 GRAD_ACC_STEPS = 1
+SAMPLE_SIZE = 384
 
 # Split latent cache batches into N fragments.
 LATENT_BATCH_SPLIT = 1
@@ -122,7 +123,7 @@ RRC_LATENT = False # Compute the RRC loss in latent space, instead of pixel spac
 TRAIN_ENCODER = True
 
 # KL regularization. CompVis used a small amount (1e-6). It probably should be higher.
-COST_KL = 2e-4
+COST_KL = 5e-4
 
 # What should hopefully make repair of the VAE feasible.
 # Compvis KL-F8's anomaly is believed to be a spot the model learned to blow out in order
@@ -133,12 +134,12 @@ COST_KL = 2e-4
 # scaled by a sigmoid mask based on the log-variance of the prior model's latent space.
 REPAIR_ENCODER = True
 
-COST_PRIOR_MEAN = 100.0
-PRIOR_MEAN_MASK_EDGE = -22
-PRIOR_MEAN_MASK_CENTER = -26
+COST_PRIOR_MEAN = 20.0
+PRIOR_MEAN_MASK_EDGE = -20
+PRIOR_MEAN_MASK_CENTER = -24
 
-COST_PRIOR_LOGVAR = 75.0
-PRIOR_LOGVAR_CLIP = (-18, -6)
+COST_PRIOR_LOGVAR = 15.0
+PRIOR_LOGVAR_CLIP = (-18, -4)
 
 # I highly recommend starting from "stabilityai/sd-vae-ft-mse" if using this for a SD1.5/2.1 decoder finetune.
 # It is much better trained than the stock kl-f8 autoencoder from SD 1.5 and losses starting out will likely be lower.
@@ -172,7 +173,7 @@ def init_lpips(rng, image_size):
 
 lpips_rng, training_rng, dataset_rng, valset_rng = jax.random.split(jax.random.PRNGKey(0), 4)
 
-lpips_params = init_lpips(lpips_rng, image_size=256)
+lpips_params = init_lpips(lpips_rng, image_size=SAMPLE_SIZE)
 
 lr_schedule = optax.join_schedules(
     schedules=[
@@ -668,8 +669,8 @@ def train_step_disc(
 
 # data loader without shuffle, so we can see the progress on the same images
 # Take the first 128 images as validation set
-train_ds = DecoderImageDataset(hfds.select(range(128, len(hfds))), root=DATA_ROOT) # type: ignore
-test_ds = DecoderImageDataset(hfds.select(range(128)), root=DATA_ROOT) # type: ignore
+train_ds = DecoderImageDataset(hfds.select(range(128, len(hfds))), SAMPLE_SIZE, root=DATA_ROOT) # type: ignore
+test_ds = DecoderImageDataset(hfds.select(range(128)), SAMPLE_SIZE, root=DATA_ROOT) # type: ignore
 
 dataloader = JaxBatchDataloader(dataset_rng, BATCH_SIZE, train_ds)
 test_dl = JaxBatchDataloader(valset_rng, BATCH_SIZE, test_ds, only_once=True)

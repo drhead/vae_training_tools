@@ -18,10 +18,11 @@ class RNGStateWrapper:
         self.rng = rng
 
 class DecoderImageDataset():
-    def __init__(self, hfds, root=None):
+    def __init__(self, hfds, img_size, root=None):
         """hdfs: HFDataset"""
         self.hfds = hfds
         self.root = root
+        self.img_size = img_size
 
     def __len__(self):
         return len(self.hfds)
@@ -73,13 +74,23 @@ class DecoderImageDataset():
             H, W, C = img_array.shape
 
             # Random square crop + resize to 256x256
-            crop_size = jax.random.randint(size_rng, (), 256, np.minimum(H, W)).item()
+            crop_size = jax.random.randint(size_rng, (), self.img_size, np.minimum(H, W)).item()
             croph_rng, cropw_rng = jax.random.split(crop_rng)
             croph = jax.random.randint(croph_rng, (), 0, H - crop_size).item()
             cropw = jax.random.randint(cropw_rng, (), 0, W - crop_size).item()
             img_array = img_array[croph:croph+crop_size, cropw:cropw+crop_size]
             # img_array = cv2.resize(img_array, (256, 256), interpolation=cv2.INTER_AREA)
-            img_array = np.asarray(Image.fromarray(img_array).resize((256, 256), Image.Resampling.LANCZOS, reducing_gap=3.0))
+            img_array = np.asarray(Image.fromarray(img_array).resize((self.img_size, self.img_size), Image.Resampling.LANCZOS, reducing_gap=3.0))
+
+            # desat_rng, _ = jax.random.split(size_rng)
+            # desat_jitter = jax.random.uniform(desat_rng)
+            # img_array = np.asarray(img_array, dtype=np.float32)
+            # if desat_jitter < 0.4:
+            #     latent_sepia = [131, 113, 100]
+            #     img_array[:, :, 0] = np.clip(img_array[:, :, 0] + (latent_sepia[0] - img_array[:, :, 0]) * desat_jitter, 0, 255)
+            #     img_array[:, :, 1] = np.clip(img_array[:, :, 1] + (latent_sepia[1] - img_array[:, :, 1]) * desat_jitter, 0, 255)
+            #     img_array[:, :, 2] = np.clip(img_array[:, :, 2] + (latent_sepia[2] - img_array[:, :, 2]) * desat_jitter, 0, 255)
+            # img_array = np.asarray(np.round(img_array), dtype=np.uint8)
 
             # Random flips, both axes
             if jax.random.uniform(fliph_rng) > 0.5:
