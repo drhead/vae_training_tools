@@ -1,6 +1,7 @@
 # credits:
 # Flax code is adapted from https://github.com/huggingface/transformers/blob/main/examples/flax/vision/run_image_classification.py
 # GAN related code are adapted from https://github.com/patil-suraj/vit-vqgan/
+# Further adapted from https://github.com/cccntu/fine-tune-models/ by Jonathan Chang
 import os
 from queue import Queue
 from threading import Thread
